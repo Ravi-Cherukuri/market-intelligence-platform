@@ -1,0 +1,134 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?Set POSTGRES_IMAGE to an immutable digest}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - work_mem=4MB
+    environment:
+      POSTGRES_DB: market_intel
+      POSTGRES_USER: market_intel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in runtime.env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market_intel -d market_intel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    cap_drop: [NET_RAW]
+    mem_limit: 448m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  api:
+    image: ${API_IMAGE:?Set API_IMAGE to an immutable ECR digest}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set an escaped DATABASE_URL in runtime.env}
+      ENVIRONMENT: production
+      COMPANY_NAME: ${COMPANY_NAME:-Pilot Company}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-Admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in runtime.env}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:?Set WHATSAPP_API_VERSION in runtime.env}
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:?Set WHATSAPP_APP_SECRET in runtime.env}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:?Set WHATSAPP_VERIFY_TOKEN in runtime.env}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:?Set WHATSAPP_PHONE_NUMBER_ID in runtime.env}
+      WHATSAPP_SIGNATURE_REQUIRED: "true"
+      CONVERSATION_TIMEOUT_MINUTES: ${CONVERSATION_TIMEOUT_MINUTES:-30}
+      MAX_WEBHOOK_BYTES: ${MAX_WEBHOOK_BYTES:-2000000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    cap_drop: [NET_RAW]
+    mem_limit: 320m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  worker:
+    image: ${API_IMAGE:?Set API_IMAGE to an immutable ECR digest}
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set an escaped DATABASE_URL in runtime.env}
+      ENVIRONMENT: production
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:?Set WHATSAPP_API_VERSION in runtime.env}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:?Set WHATSAPP_ACCESS_TOKEN in runtime.env}
+      WHATSAPP_GRAPH_BASE_URL: ${WHATSAPP_GRAPH_BASE_URL:-https://graph.facebook.com}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in runtime.env}
+      OPENAI_MONTHLY_BUDGET_USD: ${OPENAI_MONTHLY_BUDGET_USD:-50}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_SHARED_CREDENTIALS_FILE: /home/app/.aws/credentials
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in runtime.env}
+      CLAMAV_HOST: ${CLAMAV_HOST:-}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CONVERSATION_TIMEOUT_MINUTES: ${CONVERSATION_TIMEOUT_MINUTES:-30}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    cap_drop: [NET_RAW]
+    mem_limit: 320m
+    volumes:
+      - /etc/fieldintel/worker-aws:/home/app/.aws:ro
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  web:
+    image: ${WEB_IMAGE:?Set WEB_IMAGE to an immutable ECR digest}
+    environment:
+      NEXT_PUBLIC_API_URL: /api/v1
+      API_INTERNAL_URL: http://api:8000
+      # The Next proxy owns the short-lived browser session and must use the
+      # same temporary pilot credential when forwarding Basic auth to FastAPI.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-Admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in runtime.env}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    cap_drop: [NET_RAW]
+    mem_limit: 384m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  caddy:
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE to an immutable digest}
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN in runtime.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
+    cap_drop: [NET_RAW]
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

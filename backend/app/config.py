@@ -62,12 +62,9 @@ class Settings(BaseSettings):
             errors.append("ADMIN_PASSWORD must be changed and contain at least 12 characters")
         required = {
             "WHATSAPP_API_VERSION": self.whatsapp_api_version,
-            "WHATSAPP_ACCESS_TOKEN": self.whatsapp_access_token,
             "WHATSAPP_APP_SECRET": self.whatsapp_app_secret,
             "WHATSAPP_VERIFY_TOKEN": self.whatsapp_verify_token,
             "WHATSAPP_PHONE_NUMBER_ID": self.whatsapp_phone_number_id,
-            "OPENAI_API_KEY": self.openai_api_key,
-            "S3_BUCKET": self.s3_bucket,
         }
         errors.extend(f"{name} is required" for name, value in required.items() if not value)
         return errors

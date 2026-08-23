@@ -166,6 +166,63 @@ def ingest_whatsapp_message(
     message_type, text_content, provider_media_id = _message_parts(message)
     command = normalized_command(text_content) if message_type == MessageType.TEXT else None
 
+    # Unsupported attachments are acknowledged without becoming field
+    # evidence. In particular, they must not open/extend a conversation or be
+    # passed to the intelligence layer as an empty "media awaiting" message.
+    if message_type == MessageType.UNSUPPORTED:
+        session.add(
+            InboundMessageReceipt(
+                company_id=channel.company_id,
+                provider_message_id=provider_message_id,
+                disposition="unsupported_attachment",
+                received_at=received_at,
+            )
+        )
+        session.flush()
+        session.add(
+            AuditEvent(
+                company_id=channel.company_id,
+                event_type="whatsapp.unsupported_attachment",
+                actor_type="employee",
+                actor_reference=employee.employee_code,
+                metadata_json={"provider_message_id": provider_message_id},
+            )
+        )
+        session.add(
+            OutboundMessage(
+                company_id=channel.company_id,
+                channel_id=channel.id,
+                recipient_wa_id=wa_id,
+                message_kind="unsupported_attachment",
+                body="This attachment type is not supported. Please send text, a voice note, or a photo.",
+            )
+        )
+        return IngestionResult("unsupported")
+
+    # Meta media envelopes must contain an id that can be fetched through the
+    # authenticated Graph API. A malformed envelope is acknowledged and
+    # audited, but must not create evidence that waits forever for media.
+    if message_type in {MessageType.AUDIO, MessageType.IMAGE} and not provider_media_id:
+        session.add(
+            InboundMessageReceipt(
+                company_id=channel.company_id,
+                provider_message_id=provider_message_id,
+                disposition="malformed_media",
+                received_at=received_at,
+            )
+        )
+        session.flush()
+        session.add(
+            AuditEvent(
+                company_id=channel.company_id,
+                event_type="whatsapp.malformed_media",
+                actor_type="employee",
+                actor_reference=employee.employee_code,
+                metadata_json={"provider_message_id": provider_message_id, "message_type": message_type.value},
+            )
+        )
+        return IngestionResult("malformed_media")
+
     conversation = session.scalar(
         select(FieldConversation)
         .where(
@@ -250,16 +307,6 @@ def ingest_whatsapp_message(
                 company_id=channel.company_id,
                 message_id=stored.id,
                 provider_media_id=provider_media_id,
-            )
-        )
-    if message_type == MessageType.UNSUPPORTED:
-        session.add(
-            OutboundMessage(
-                company_id=channel.company_id,
-                channel_id=channel.id,
-                recipient_wa_id=wa_id,
-                message_kind="unsupported_attachment",
-                body="This attachment type is not supported. Please send text, a voice note, or a photo.",
             )
         )
     return IngestionResult("accepted", stored.id, conversation.id)

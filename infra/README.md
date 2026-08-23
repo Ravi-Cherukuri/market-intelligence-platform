@@ -12,6 +12,9 @@ explicitly approved step.
   deployed in `us-east-1`.
 - `architecture.md` - design constraints and recovery limits shared by both
   templates.
+- `scripts/` and `systemd/` - verified database backup/restore and freshness
+  monitoring installed by the release workflow.
+- `restore-runbook.md` - destructive recovery procedure and smoke checks.
 
 ## Deployment order
 
@@ -22,7 +25,18 @@ explicitly approved step.
 5. Confirm the SNS email subscription.
 6. Add a GoDaddy A record: host `fieldintel`, value from the
    `ElasticIpAddress` stack output, TTL 600 seconds.
-7. Deploy the signed application release and configure runtime secrets.
+7. Deploy the checksummed, IAM-controlled application release and configure runtime secrets.
+
+The package checksum detects transfer corruption. Release write access is
+restricted by IAM and S3 versioning; the pilot does not yet implement a
+separate cryptographic code-signing authority.
+
+Apply `infra/cloudformation/pilot-stack-policy.json` after stack creation and
+enable CloudFormation termination protection. Before any reviewed change set
+that must replace the host or EBS attachment, run
+`sudo /opt/fieldintel/current/scripts/quiesce-host.sh --confirm-stop-fieldintel` through
+SSM, confirm the tested backup and unmount succeeded, then temporarily relax
+only the affected stack-policy resource for that one change set.
 8. Confirm HTTPS health before entering the Meta webhook URL.
 
 The templates never contain application-provider credentials. Runtime secrets

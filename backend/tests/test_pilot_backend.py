@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import base64
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 import pytest
+import httpx
 
 from app.domain.conversations import belongs_to_open_conversation, normalized_command
 from app.domain.identity import InvalidPhoneNumber, normalize_indian_whatsapp_number
@@ -50,7 +52,14 @@ from app.services.imports import (
 )
 from app.services.ingestion import ingest_whatsapp_message
 from app.services.signals import upsert_signal
-from app.integrations.whatsapp import DownloadedMedia
+from app.integrations.whatsapp import (
+    DownloadedMedia,
+    WhatsAppClient,
+    WhatsAppMediaValidationError,
+    validate_provider_sha256,
+    validate_supported_media,
+)
+import app.integrations.whatsapp as whatsapp_integration
 import app.worker as worker
 
 
@@ -227,16 +236,164 @@ def test_document_attachment_is_rejected_without_creating_media_work(db_session:
         timeout_minutes=30,
     )
     db_session.commit()
-    stored = db_session.scalar(
+    assert result.status == "unsupported"
+    assert db_session.scalar(
         select(FieldMessage).where(FieldMessage.provider_message_id == "wamid-document")
-    )
-
-    assert result.status == "accepted"
-    assert stored is not None
-    assert stored.message_type == MessageType.UNSUPPORTED
-    assert stored.provider_media_id is None
+    ) is None
+    assert db_session.scalar(select(func.count()).select_from(FieldConversation)) == 0
     assert db_session.scalar(select(func.count()).select_from(MediaAsset)) == 0
     assert db_session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+
+
+def test_unsupported_attachment_does_not_extend_an_existing_conversation(db_session: Session) -> None:
+    _, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    accepted = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-before-document"),
+        timeout_minutes=30,
+    )
+    db_session.commit()
+    conversation = db_session.get(FieldConversation, accepted.conversation_id)
+    assert conversation is not None
+    original_last_message_at = conversation.last_message_at
+
+    result = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message={
+            "id": "wamid-document-after-text",
+            "from": "9876543210",
+            "timestamp": epoch(BASE_TIME + timedelta(minutes=10)),
+            "type": "document",
+            "document": {"id": "provider-document-id"},
+        },
+        timeout_minutes=30,
+    )
+    db_session.commit()
+    db_session.refresh(conversation)
+
+    assert result.status == "unsupported"
+    assert conversation.last_message_at == original_last_message_at
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 1
+
+
+@pytest.mark.parametrize(
+    ("content", "mime_type"),
+    [
+        (b"\xff\xd8\xffphoto", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\nphoto", "image/png"),
+        (b"RIFF\x00\x00\x00\x00WEBPphoto", "image/webp"),
+        (b"OggSvoice", "audio/ogg; codecs=opus"),
+        (b"\x00\x00\x00\x18ftypM4A ", "audio/mp4"),
+    ],
+)
+def test_media_signature_validation_accepts_only_matching_voice_and_photo_types(
+    content: bytes, mime_type: str
+) -> None:
+    assert validate_supported_media(content, mime_type) == mime_type.split(";", 1)[0]
+
+
+@pytest.mark.parametrize(
+    ("content", "mime_type"),
+    [
+        (b"PK\x03\x04spreadsheet", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        (b"not-a-jpeg", "image/jpeg"),
+        (b"\xff\xd8\xffphoto", "audio/ogg"),
+    ],
+)
+def test_media_signature_validation_rejects_unsupported_or_mismatched_content(
+    content: bytes, mime_type: str
+) -> None:
+    with pytest.raises(WhatsAppMediaValidationError):
+        validate_supported_media(content, mime_type)
+
+
+def test_provider_media_checksum_accepts_hex_and_base64_and_rejects_mismatch() -> None:
+    content = b"OggSverified voice note"
+    digest = hashlib.sha256(content).digest()
+    validate_provider_sha256(content, digest.hex())
+    validate_provider_sha256(content, base64.b64encode(digest).decode("ascii"))
+    with pytest.raises(WhatsAppMediaValidationError):
+        validate_provider_sha256(content, "0" * 64)
+
+
+def test_whatsapp_download_streams_and_verifies_provider_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    content = b"OggSverified download"
+    digest = hashlib.sha256(content).hexdigest()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.facebook.com":
+            return httpx.Response(
+                200,
+                json={
+                    "url": "https://media.example/voice",
+                    "file_size": len(content),
+                    "mime_type": "audio/ogg",
+                    "sha256": digest,
+                },
+            )
+        return httpx.Response(200, content=content, headers={"content-type": "audio/ogg"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        whatsapp_integration.httpx,
+        "Client",
+        lambda **_: real_client(transport=transport),
+    )
+    downloaded = WhatsAppClient(
+        base_url="https://graph.facebook.com", api_version="v99.0", access_token="test-token"
+    ).download_media("media-id")
+
+    assert downloaded.content == content
+    assert downloaded.mime_type == "audio/ogg"
+    assert downloaded.provider_sha256 == digest
+
+
+def test_whatsapp_download_rejects_declared_oversize_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            json={"url": "https://media.example/huge", "file_size": 26_000_000, "mime_type": "audio/ogg"},
+        )
+    )
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        whatsapp_integration.httpx,
+        "Client",
+        lambda **_: real_client(transport=transport),
+    )
+    client = WhatsAppClient(
+        base_url="https://graph.facebook.com", api_version="v99.0", access_token="test-token"
+    )
+    with pytest.raises(WhatsAppMediaValidationError, match="size limit"):
+        client.download_media("media-id")
+
+
+@pytest.mark.parametrize("media_type", ["audio", "image"])
+def test_media_without_provider_id_is_audited_without_opening_conversation(
+    db_session: Session, media_type: str
+) -> None:
+    _, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    result = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message={
+            "id": f"wamid-missing-{media_type}-id",
+            "from": "9876543210",
+            "timestamp": epoch(BASE_TIME),
+            "type": media_type,
+            media_type: {},
+        },
+        timeout_minutes=30,
+    )
+    db_session.commit()
+
+    assert result.status == "malformed_media"
+    assert db_session.scalar(select(func.count()).select_from(FieldConversation)) == 0
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 0
+    assert db_session.scalar(select(func.count()).select_from(MediaAsset)) == 0
 
 
 @pytest.mark.parametrize(
@@ -319,6 +476,63 @@ def test_pilot_media_is_stored_as_unscanned_without_local_decoding(
     assert stored["company_id"] == company.id
     assert stored["media_id"] == provider_media_id
     assert stored["content"] == b"safe pilot media"
+
+
+def test_invalid_provider_media_is_terminal_and_unblocks_closed_conversation(
+    db_session: Session,
+    session_factory,
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    result = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message={
+            "id": "wamid-invalid-media",
+            "from": "9876543210",
+            "timestamp": epoch(BASE_TIME),
+            "type": "image",
+            "image": {"id": "invalid-provider-media"},
+        },
+        timeout_minutes=30,
+    )
+    conversation = db_session.get(FieldConversation, result.conversation_id)
+    assert conversation is not None
+    conversation.status = ConversationStatus.CLOSED
+    conversation.closed_at = BASE_TIME
+    conversation.analysis_status = "awaiting_media"
+    db_session.commit()
+
+    class InvalidMediaClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def download_media(self, _: str) -> DownloadedMedia:
+            raise WhatsAppMediaValidationError("checksum mismatch")
+
+    class UnusedMediaStore:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def put_inbound_media(self, **_: object) -> tuple[str, str]:
+            raise AssertionError("Rejected media must never reach object storage")
+
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker, "WhatsAppClient", InvalidMediaClient)
+    monkeypatch.setattr(worker, "S3MediaStore", UnusedMediaStore)
+
+    assert worker.process_media_assets() == 1
+    db_session.expire_all()
+    asset = db_session.scalar(select(MediaAsset).where(MediaAsset.provider_media_id == "invalid-provider-media"))
+    message = db_session.get(FieldMessage, result.message_id)
+    conversation = db_session.get(FieldConversation, result.conversation_id)
+    assert asset is not None
+    assert asset.scan_status == "rejected_invalid_media"
+    assert asset.analysis_status == "blocked"
+    assert message is not None and message.derived_text == "[invalid media omitted]"
+    assert conversation is not None and conversation.analysis_status == "waiting"
 
 
 def test_unknown_sender_discards_message_and_media_but_keeps_minimal_audit_event(

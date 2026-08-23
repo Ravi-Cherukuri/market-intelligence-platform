@@ -8,15 +8,25 @@ function safeEqual(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function sessionToken(username: string, password: string): string {
-  return createHmac("sha256", password).update(`field-intelligence:${username}`).digest("base64url");
+function sessionSignature(username: string, password: string, expiresAt: string): string {
+  return createHmac("sha256", password)
+    .update(`field-intelligence:${username}:${expiresAt}`)
+    .digest("base64url");
+}
+
+function validSession(token: string, username: string, password: string): boolean {
+  const separator = token.indexOf(".");
+  if (separator < 1) return false;
+  const expiresAt = token.slice(0, separator);
+  const signature = token.slice(separator + 1);
+  if (!/^\d{13}$/.test(expiresAt) || Number(expiresAt) <= Date.now()) return false;
+  return safeEqual(signature, sessionSignature(username, password, expiresAt));
 }
 
 export function proxy(request: NextRequest) {
   const expectedUser = process.env.ADMIN_USERNAME ?? "Admin";
   const expectedPassword = process.env.ADMIN_PASSWORD ?? "Password";
   const authorization = request.headers.get("authorization");
-  const expectedSession = sessionToken(expectedUser, expectedPassword);
   const session = request.cookies.get("pilot_admin_session")?.value ?? "";
   let basicAuthenticated = false;
 
@@ -32,7 +42,7 @@ export function proxy(request: NextRequest) {
     }
   }
 
-  const sessionAuthenticated = safeEqual(session, expectedSession);
+  const sessionAuthenticated = validSession(session, expectedUser, expectedPassword);
   if (basicAuthenticated || sessionAuthenticated) {
     const requestHeaders = new Headers(request.headers);
     // Background requests cannot reliably repeat the browser's Basic header.
@@ -45,7 +55,9 @@ export function proxy(request: NextRequest) {
     }
     const response = NextResponse.next({ request: { headers: requestHeaders } });
     if (basicAuthenticated) {
-      response.cookies.set("pilot_admin_session", expectedSession, {
+      const expiresAt = String(Date.now() + 60 * 60 * 8 * 1000);
+      const signedSession = `${expiresAt}.${sessionSignature(expectedUser, expectedPassword, expiresAt)}`;
+      response.cookies.set("pilot_admin_session", signedSession, {
         httpOnly: true,
         maxAge: 60 * 60 * 8,
         path: "/",

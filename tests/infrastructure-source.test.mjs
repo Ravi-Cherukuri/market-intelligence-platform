@@ -17,6 +17,14 @@ test("pilot infrastructure keeps the approved low-cost security boundaries", asy
   assert.match(template, /HttpPutResponseHopLimit: 2/);
   assert.match(template, /Encrypted: true/);
   assert.match(template, /AmazonSSMManagedInstanceCore/);
+  assert.match(template, /WorkerMediaRole:/);
+  assert.match(template, /PilotInstance:\n\s+Type: AWS::EC2::Instance\n\s+DependsOn:\n\s+- WorkerMediaRole\n\s+- DefaultInternetRoute/);
+  assert.match(template, /InboundMediaWriteOnly/);
+  assert.match(template, /RequiresMountsFor=\/var\/lib\/docker/);
+  assert.match(template, /refresh-worker-credentials\.sh/);
+  assert.match(template, /CreationPolicy:[\s\S]*?ResourceSignal:/);
+  assert.match(template, /DataVolumeMountAssociation:/);
+  assert.match(template, /WaitForSuccessTimeoutSeconds: 900/);
   assert.doesNotMatch(template, /FromPort: 22|ToPort: 22/);
   assert.doesNotMatch(template, /WHATSAPP_ACCESS_TOKEN|OPENAI_API_KEY|ADMIN_PASSWORD/);
 });
@@ -31,6 +39,45 @@ test("stateful infrastructure is retained and private", async () => {
   assert.match(template, /RestrictPublicBuckets: true/);
   assert.match(template, /aws:SecureTransport: 'false'/);
   assert.match(template, /ApplicationRepository:\n[\s\S]*?ImageTagMutability: IMMUTABLE/);
+  assert.match(template, /Service: sns\.amazonaws\.com/);
+  assert.match(template, /DatabaseBackupStaleAlarm:/);
+  assert.match(template, /Prefix: backups\/database\//);
+  assert.doesNotMatch(template, /s3:DeleteObject/);
+  assert.doesNotMatch(template, /Resource: !Sub '\$\{StorageBucket\.Arn\}\/\*'/);
+});
+
+test("production releases use ARM64 ECR digests with health-checked rollback", async () => {
+  const compose = await source("docker-compose.production.yml");
+  const build = await source("infra/scripts/build-release.sh");
+  const activate = await source("infra/scripts/activate-release.sh");
+  const releaseEnv = await source("infra/scripts/release-env.sh");
+  const webDockerfile = await source("Dockerfile.web");
+
+  assert.match(compose, /API_IMAGE:\?Set API_IMAGE to an immutable ECR digest/);
+  assert.match(compose, /WEB_IMAGE:\?Set WEB_IMAGE to an immutable ECR digest/);
+  assert.match(build, /--platform linux\/arm64/);
+  assert.match(build, /describe-image-scan-findings/);
+  assert.match(build, /CRITICAL/);
+  assert.match(releaseEnv, /@sha256:/);
+  assert.match(activate, /ecr get-login-password/);
+  assert.match(activate, /restoring previous release/);
+  assert.match(activate, /RUN_MIGRATIONS=1/);
+  assert.match(activate, /health_check \"\$PREVIOUS_DIR\"/);
+  assert.match(webDockerfile, /API_INTERNAL_URL=http:\/\/api:8000/);
+  assert.match(activate, /\/api\/v1\/admin\/setup/);
+});
+
+test("logical backups are validated, size-checked, retained, and monitored", async () => {
+  const backup = await source("infra/scripts/backup-postgres.sh");
+  const health = await source("infra/scripts/report-backup-age.sh");
+
+  assert.match(backup, /pg_dump/);
+  assert.match(backup, /pg_restore --list/);
+  assert.match(backup, /pg_restore[\s\S]*--exit-on-error/);
+  assert.match(backup, /head-object/);
+  assert.match(backup, /REMOTE_SHA256/);
+  assert.match(backup, /DatabaseBackupSuccess/);
+  assert.match(health, /DatabaseBackupAgeSeconds/);
 });
 
 test("budget stack retains all approved alert thresholds", async () => {

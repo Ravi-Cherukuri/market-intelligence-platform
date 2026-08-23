@@ -10,7 +10,7 @@ A WhatsApp-first, evidence-led market-intelligence platform for agricultural inp
 - Idempotent inbound processing using Meta message IDs
 - Rolling 30-minute field conversations with `Done` and `New report`
 - Text, audio, image, and location message persistence; documents are rejected in the pilot
-- Background media retrieval, size controls, and tenant-scoped S3 storage
+- Streamed, bounded media retrieval with MIME/signature validation and tenant-scoped S3 storage
 - OpenAI transcription, image interpretation, structured extraction, and adaptive model routing
 - Weak/strong signal aggregation using distinct employee evidence
 - Append-only competition price history with separate farmer and channel-net prices
@@ -36,8 +36,11 @@ docker-compose.yml           Single-VM pilot runtime
 The API and background worker are separate processes from one monolithic codebase. This keeps slow media and AI calls away from the webhook response without introducing microservices.
 
 The 2 GiB pilot host intentionally does not run ClamAV. Meta-delivered photos
-and voice notes are stored but never decoded or executed locally. Document
-attachments remain disabled until the host or scanning architecture is expanded.
+and voice notes are streamed into a bounded buffer, validated by MIME and file
+signature, stored without local decoding or execution, and may be sent to
+OpenAI for the explicitly accepted pilot transcription/image-analysis path.
+Document attachments remain disabled until the host or scanning architecture
+is expanded.
 
 ## Local development
 

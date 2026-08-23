@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish FieldIntel database backup age
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fieldintel/current/scripts/report-backup-age.sh
+User=root
+Group=root

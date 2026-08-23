@@ -1,0 +1,13 @@
+[Unit]
+Description=Restrict EC2 metadata access to the FieldIntel worker
+Requires=docker.service
+After=docker.service
+Before=fieldintel-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fieldintel/current/scripts/configure-container-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

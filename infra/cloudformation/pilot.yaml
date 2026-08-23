@@ -202,6 +202,12 @@ Resources:
             Prefix: releases/
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
+          - Id: ExpireDatabaseBackups
+            Status: Enabled
+            Prefix: backups/database/
+            ExpirationInDays: 35
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
@@ -260,7 +266,7 @@ Resources:
       ImageTagMutability: IMMUTABLE
       LifecyclePolicy:
         LifecyclePolicyText: >-
-          {"rules":[{"rulePriority":1,"description":"Expire untagged images after 7 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}},{"rulePriority":2,"description":"Keep twenty tagged releases","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},"action":{"type":"expire"}}]}
+          {"rules":[{"rulePriority":1,"description":"Expire untagged images after 7 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}},{"rulePriority":2,"description":"Keep twenty four-image releases","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":80},"action":{"type":"expire"}}]}
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -276,6 +282,8 @@ Resources:
           - never log message bodies, credentials, or media URLs
         mutable: free-to-tune
     Properties:
+      KmsKeyId: !GetAtt AlarmKey.Arn
+      LogGroupName: !Sub '/fieldintel/${AWS::StackName}/host'
       RetentionInDays: 14
       Tags:
         - Key: Environment
@@ -287,9 +295,9 @@ Resources:
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
-        why: encrypt alarm notifications while allowing CloudWatch to publish
+        why: encrypt alarm notifications and retained host logs with one low-cost operations key
         must:
-          - key policy retains account administration and CloudWatch publish access
+          - key policy retains account administration plus scoped SNS and Logs access
         mutable: review-required
     Properties:
       Description: Encryption key for field intelligence pilot alarm notifications
@@ -304,17 +312,31 @@ Resources:
               AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: kms:*
             Resource: '*'
-          - Sid: CloudWatchAlarmPublishing
+          - Sid: SnsTopicEncryption
             Effect: Allow
             Principal:
-              Service: cloudwatch.amazonaws.com
+              Service: sns.amazonaws.com
             Action:
               - kms:Decrypt
-              - kms:GenerateDataKey
+              - kms:GenerateDataKey*
             Resource: '*'
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: CloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/fieldintel/${AWS::StackName}/host*'
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -345,6 +367,7 @@ Resources:
           - scope S3 and ECR access to this stack
         mutable: review-required
     Properties:
+      RoleName: !Sub '${AWS::StackName}-host'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -359,18 +382,20 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: StorageList
+              - Sid: AssumeWorkerMediaRole
                 Effect: Allow
-                Action:
-                  - s3:ListBucket
-                Resource: !GetAtt StorageBucket.Arn
-              - Sid: StorageObjects
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-worker-media'
+              - Sid: DatabaseBackupWriteAndRestore
                 Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                  - s3:DeleteObject
-                Resource: !Sub '${StorageBucket.Arn}/*'
+                Resource: !Sub '${StorageBucket.Arn}/backups/database/*'
+              - Sid: ReleaseRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${StorageBucket.Arn}/releases/*'
               - Sid: EcrAuthorization
                 Effect: Allow
                 Action: ecr:GetAuthorizationToken
@@ -389,6 +414,10 @@ Resources:
                 Condition:
                   StringEquals:
                     cloudwatch:namespace: FieldIntel/Pilot
+              - Sid: BootstrapSignal
+                Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
               - Sid: HostLogs
                 Effect: Allow
                 Action:
@@ -396,6 +425,39 @@ Resources:
                   - logs:DescribeLogStreams
                   - logs:PutLogEvents
                 Resource: !GetAtt InstanceLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  WorkerMediaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolate the message-processing container from host administration and backups
+        must:
+          - permit only inbound media object writes
+          - use rotating STS credentials; never expose the instance profile to containers
+        mutable: review-required
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-worker-media'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-host'
+      Policies:
+        - PolicyName: InboundMediaWriteOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${StorageBucket.Arn}/companies/*/inbound/*'
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -458,18 +520,139 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
-            set -euxo pipefail
+            set -euo pipefail
 
-            dnf install -y docker amazon-cloudwatch-agent jq
+            BASE_SIGNAL_SENT=0
+            signal_instance() {
+              /opt/aws/bin/cfn-signal -e "$1" \
+                --stack '${AWS::StackName}' \
+                --resource PilotInstance \
+                --region '${AWS::Region}'
+            }
+            signal_failure() {
+              status=$?
+              if [ "$BASE_SIGNAL_SENT" -eq 0 ] && [ -x /opt/aws/bin/cfn-signal ]; then
+                signal_instance "$status" || true
+              fi
+              exit "$status"
+            }
+            trap signal_failure EXIT
+
+            dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq curl iptables-nft
+            install -d -m 0755 /usr/local/libexec/docker/cli-plugins
+            curl --fail --location --silent --show-error \
+              https://github.com/docker/compose/releases/download/v5.4.0/docker-compose-linux-aarch64 \
+              --output /usr/local/libexec/docker/cli-plugins/docker-compose
+            echo 'fc5d1371f1ec7987e703da94ede49af3fbfb240b83f22991a98511de7bc4b93b  /usr/local/libexec/docker/cli-plugins/docker-compose' | sha256sum --check --strict
+            chmod 0755 /usr/local/libexec/docker/cli-plugins/docker-compose
+            docker compose version
             systemctl enable --now amazon-ssm-agent
 
             install -d -m 0750 -o ec2-user -g ec2-user /opt/fieldintel
+            install -d -m 0755 /opt/fieldintel/bin
             install -d -m 0750 /var/log/fieldintel
             usermod -aG docker ec2-user
 
             systemctl stop docker || true
             install -d -m 0710 /var/lib/docker
 
+            cat >/etc/docker/daemon.json <<'JSON'
+            {
+              "log-driver": "json-file",
+              "log-opts": {"max-size": "10m", "max-file": "3"}
+            }
+            JSON
+
+            cat >/opt/fieldintel/bin/block-container-metadata.sh <<'FIREWALL_SCRIPT'
+            #!/bin/bash
+            set -euo pipefail
+            while iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null; do
+              iptables -D DOCKER-USER -d 169.254.169.254/32 -j REJECT
+            done
+            iptables -I DOCKER-USER 1 -d 169.254.169.254/32 -j REJECT
+            if [ -x /opt/fieldintel/current/scripts/configure-container-firewall.sh ]; then
+              /opt/fieldintel/current/scripts/configure-container-firewall.sh
+            fi
+            FIREWALL_SCRIPT
+            chmod 0755 /opt/fieldintel/bin/block-container-metadata.sh
+            install -d -m 0755 /etc/systemd/system/docker.service.d
+            cat >/etc/systemd/system/docker.service.d/fieldintel-metadata.conf <<'DROPIN'
+            [Unit]
+            RequiresMountsFor=/var/lib/docker
+            After=var-lib-docker.mount
+
+            [Service]
+            ExecStartPre=/usr/bin/mountpoint -q /var/lib/docker
+            ExecStartPre=/usr/bin/test -f /opt/fieldintel/DATA_VOLUME_READY
+            ExecStartPost=/opt/fieldintel/bin/block-container-metadata.sh
+            DROPIN
+            systemctl daemon-reload
+
+            install -d -m 0750 -o root /etc/fieldintel/worker-aws
+            chown root:10001 /etc/fieldintel/worker-aws
+            cat >/opt/fieldintel/bin/refresh-worker-credentials.sh <<'CREDENTIAL_SCRIPT'
+            #!/bin/bash
+            set -euo pipefail
+            ROLE_ARN='arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-worker-media'
+            CREDENTIAL_JSON=''
+            for attempt in $(seq 1 12); do
+              if CREDENTIAL_JSON=$(aws sts assume-role --role-arn "$ROLE_ARN" \
+                --role-session-name fieldintel-worker --duration-seconds 3600 --output json); then
+                break
+              fi
+              sleep 10
+            done
+            test -n "$CREDENTIAL_JSON"
+            TEMP_FILE=$(mktemp /etc/fieldintel/worker-aws/credentials.XXXXXX)
+            chmod 0440 "$TEMP_FILE"
+            chown root:10001 "$TEMP_FILE"
+            jq -er '"[default]\naws_access_key_id=" + .Credentials.AccessKeyId + "\naws_secret_access_key=" + .Credentials.SecretAccessKey + "\naws_session_token=" + .Credentials.SessionToken' \
+              <<<"$CREDENTIAL_JSON" >"$TEMP_FILE"
+            mv -f "$TEMP_FILE" /etc/fieldintel/worker-aws/credentials
+            CREDENTIAL_SCRIPT
+            chmod 0750 /opt/fieldintel/bin/refresh-worker-credentials.sh
+            cat >/etc/systemd/system/fieldintel-worker-credentials.service <<'CREDENTIAL_SERVICE'
+            [Unit]
+            Description=Refresh scoped STS credentials for the FieldIntel worker
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/opt/fieldintel/bin/refresh-worker-credentials.sh
+            CREDENTIAL_SERVICE
+            cat >/etc/systemd/system/fieldintel-worker-credentials.timer <<'CREDENTIAL_TIMER'
+            [Unit]
+            Description=Rotate FieldIntel worker STS credentials
+
+            [Timer]
+            OnBootSec=2min
+            OnUnitActiveSec=40min
+            Persistent=true
+
+            [Install]
+            WantedBy=timers.target
+            CREDENTIAL_TIMER
+            systemctl daemon-reload
+            systemctl enable fieldintel-worker-credentials.timer
+            systemctl start fieldintel-worker-credentials.service fieldintel-worker-credentials.timer
+
+            cat >/opt/fieldintel/bin/mount-data-volume.sh <<'MOUNT_SCRIPT'
+            #!/bin/bash
+            set -euo pipefail
+            MOUNT_SUCCEEDED=0
+            cleanup_failed_mount() {
+              status=$?
+              if [ "$MOUNT_SUCCEEDED" -eq 0 ]; then
+                systemctl stop docker || true
+                sync
+                mountpoint -q /var/lib/docker && umount /var/lib/docker || true
+                rm -f /opt/fieldintel/DATA_VOLUME_READY
+              fi
+              exit "$status"
+            }
+            trap cleanup_failed_mount EXIT
+            systemctl stop docker || true
             DATA_DEVICE=''
             for attempt in $(seq 1 60); do
               if [ -b /dev/xvdf ]; then
@@ -494,17 +677,15 @@ Resources:
             fi
             DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
             if ! grep -q "$DATA_UUID" /etc/fstab; then
-              echo "UUID=$DATA_UUID /var/lib/docker xfs defaults,nofail 0 2" >> /etc/fstab
+              echo "UUID=$DATA_UUID /var/lib/docker xfs defaults 0 2" >> /etc/fstab
             fi
-            mount /var/lib/docker
-
-            cat >/etc/docker/daemon.json <<'JSON'
-            {
-              "log-driver": "json-file",
-              "log-opts": {"max-size": "10m", "max-file": "3"}
-            }
-            JSON
+            mountpoint -q /var/lib/docker || mount /var/lib/docker
+            echo 'ready' >/opt/fieldintel/DATA_VOLUME_READY
             systemctl enable --now docker
+            MOUNT_SUCCEEDED=1
+            trap - EXIT
+            MOUNT_SCRIPT
+            chmod 0755 /opt/fieldintel/bin/mount-data-volume.sh
 
             if [ ! -f /swapfile ]; then
               fallocate -l 2G /swapfile
@@ -518,7 +699,8 @@ Resources:
             {
               "agent": {"metrics_collection_interval": 60, "run_as_user": "root"},
               "logs": {"logs_collected": {"files": {"collect_list": [
-                {"file_path": "/var/log/cloud-init-output.log", "log_group_name": "${InstanceLogGroup}", "log_stream_name": "{instance_id}/cloud-init"}
+                {"file_path": "/var/log/cloud-init-output.log", "log_group_name": "${InstanceLogGroup}", "log_stream_name": "{instance_id}/cloud-init"},
+                {"file_path": "/var/lib/docker/containers/*/*-json.log", "log_group_name": "${InstanceLogGroup}", "log_stream_name": "{instance_id}/containers"}
               ]}}},
               "metrics": {
                 "namespace": "FieldIntel/Pilot",
@@ -535,11 +717,20 @@ Resources:
               -a fetch-config -m ec2 \
               -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
-            echo 'FieldIntel host bootstrap complete' >/opt/fieldintel/BOOTSTRAP_COMPLETE
+            echo 'FieldIntel base bootstrap complete' >/opt/fieldintel/BASE_BOOTSTRAP_COMPLETE
+            signal_instance 0
+            BASE_SIGNAL_SENT=1
+            trap - EXIT
 
   PilotInstance:
     Type: AWS::EC2::Instance
-    DependsOn: DefaultInternetRoute
+    DependsOn:
+      - WorkerMediaRole
+      - DefaultInternetRoute
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
     Metadata:
       com.aws.cloudformation.Context:
         why: single low-traffic pilot host; resize to t4g.medium before sustained media or local scanning
@@ -592,6 +783,38 @@ Resources:
       Device: /dev/sdf
       InstanceId: !Ref PilotInstance
       VolumeId: !Ref DataVolume
+
+  DataVolumeMountAssociation:
+    Type: AWS::SSM::Association
+    # Mount state only after every other fallible stack resource exists. This
+    # prevents initial-create rollback from detaching a live PostgreSQL volume.
+    DependsOn:
+      - DataVolumeAttachment
+      - ElasticIpAssociation
+      - DailySnapshotPolicy
+      - InstanceStatusAlarm
+      - CpuHighAlarm
+      - CpuCreditLowAlarm
+      - MemoryHighAlarm
+      - DiskHighAlarm
+      - DatabaseBackupStaleAlarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: run after EBS attachment and block stack completion until Docker state is durably mounted
+        must:
+          - timeout rather than report success when EBS mount or bootstrap fails
+          - rerun against a replacement instance before EIP reassociation
+        mutable: change-with-constraints
+    Properties:
+      Name: AWS-RunShellScript
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref PilotInstance
+      Parameters:
+        commands:
+          - /opt/fieldintel/bin/mount-data-volume.sh
+      WaitForSuccessTimeoutSeconds: 900
 
   ElasticIp:
     Type: AWS::EC2::EIP
@@ -750,6 +973,28 @@ Resources:
       Period: 300
       Statistic: Maximum
       Threshold: 80
+      TreatMissingData: breaching
+
+  DatabaseBackupStaleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: detect absent or stale logical PostgreSQL dumps independently of crash-consistent EBS snapshots
+        must:
+          - hourly health metric must report age; missing data is a failure
+        mutable: change-with-constraints
+    Properties:
+      AlarmDescription: Latest verified PostgreSQL backup is older than 26 hours
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 3
+      MetricName: DatabaseBackupAgeSeconds
+      Namespace: FieldIntel/Pilot
+      Period: 3600
+      Statistic: Maximum
+      Threshold: 93600
       TreatMissingData: breaching
 
 Outputs:

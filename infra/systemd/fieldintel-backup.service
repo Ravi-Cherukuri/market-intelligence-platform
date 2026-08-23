@@ -1,0 +1,11 @@
+[Unit]
+Description=Verified logical PostgreSQL backup for FieldIntel
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fieldintel/current/scripts/backup-postgres.sh
+User=root
+Group=root
+Nice=10

@@ -9,7 +9,10 @@ import boto3
 class S3MediaStore:
     def __init__(self, bucket: str, region: str):
         self.bucket = bucket
-        self.client = boto3.client("s3", region_name=region)
+        # The host atomically rotates the worker's one-hour, S3-only credential
+        # file. A fresh explicit Session makes each media batch reread it rather
+        # than reusing boto3's process-global cached credentials.
+        self.client = boto3.Session(region_name=region).client("s3")
 
     def put_inbound_media(
         self, *, company_id: str, media_id: str, content: bytes, mime_type: str, received_at: datetime | None = None

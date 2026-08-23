@@ -15,7 +15,11 @@ from app.database import SessionLocal
 from app.domain.conversations import utc_aware
 from app.integrations.object_store import S3MediaStore
 from app.integrations.malware import ClamAVScanner, MalwareDetected
-from app.integrations.whatsapp import WhatsAppClient, WhatsAppConfigurationError
+from app.integrations.whatsapp import (
+    WhatsAppClient,
+    WhatsAppConfigurationError,
+    WhatsAppMediaValidationError,
+)
 from app.ai.openai_client import OpenAIIntelligenceClient
 from app.models import (
     ConversationStatus,
@@ -29,6 +33,18 @@ from app.services.intelligence import process_closed_conversation
 
 logger = logging.getLogger("market_intelligence.worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+def _resolve_terminal_media_failure(session, asset: MediaAsset, placeholder: str) -> None:
+    """Unblock closed conversations without presenting rejected bytes as evidence."""
+    message = session.get(FieldMessage, asset.message_id)
+    if not message:
+        return
+    message.derived_text = placeholder
+    message.processing_status = "media_unavailable"
+    conversation = session.get(FieldConversation, message.conversation_id)
+    if conversation and conversation.status == ConversationStatus.CLOSED:
+        conversation.analysis_status = "waiting"
 
 
 def close_inactive_conversations() -> int:
@@ -142,10 +158,22 @@ def process_media_assets() -> int:
             except MalwareDetected:
                 asset.scan_status = "rejected_malware"
                 asset.analysis_status = "blocked"
+                _resolve_terminal_media_failure(session, asset, "[media rejected by safety controls]")
+            except WhatsAppMediaValidationError as exc:
+                asset.attempts += 1
+                asset.last_error_code = type(exc).__name__
+                asset.scan_status = "rejected_invalid_media"
+                asset.analysis_status = "blocked"
+                _resolve_terminal_media_failure(session, asset, "[invalid media omitted]")
             except Exception as exc:
                 asset.attempts += 1
                 asset.last_error_code = type(exc).__name__
-                asset.scan_status = "failed" if asset.attempts >= 5 else "pending"
+                if asset.attempts >= 5:
+                    asset.scan_status = "failed"
+                    asset.analysis_status = "failed"
+                    _resolve_terminal_media_failure(session, asset, "[media unavailable after repeated errors]")
+                else:
+                    asset.scan_status = "pending"
         session.commit()
         return len(assets)
 

@@ -4,21 +4,30 @@
   # Meta and infrastructure probes must reach FastAPI without administrator auth.
   @direct_api path /api/v1/webhooks/whatsapp /health /ready
   handle @direct_api {
+    request_body {
+      max_size 2MB
+    }
     reverse_proxy api:8000
   }
 
   # Browser API calls pass through Next's short-lived admin session first.
   handle /api/* {
+    request_body {
+      max_size 12MB
+    }
     reverse_proxy web:3000
   }
 
   handle {
+    request_body {
+      max_size 1MB
+    }
     reverse_proxy web:3000
   }
 
   header {
     -Server
-    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    Strict-Transport-Security "max-age=31536000"
     X-Content-Type-Options nosniff
     Permissions-Policy "camera=(), microphone=(), geolocation=()"
     Referrer-Policy strict-origin-when-cross-origin

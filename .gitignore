@@ -5,6 +5,7 @@
 /.venv
 /backend/.venv
 __pycache__/
+.coverage
 *.py[cod]
 .pytest_cache/
 *.db

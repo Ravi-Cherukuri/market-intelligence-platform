@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.models import Company, Employee, EmploymentType
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = BACKEND_ROOT.parent
 
 
 def _upgrade(database_url: str, revision: str) -> None:
@@ -25,6 +26,34 @@ def _upgrade(database_url: str, revision: str) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def test_initial_revision_is_frozen_from_live_orm_metadata() -> None:
+    source = (BACKEND_ROOT / "migrations/versions/0001_initial.py").read_text()
+
+    assert "Base.metadata" not in source
+    assert "from app import models" not in source
+    assert "op.create_table('employees'" in source
+
+
+def test_automated_migration_gate_rejects_alter_column(tmp_path) -> None:
+    versions = tmp_path / "backend/migrations/versions"
+    versions.mkdir(parents=True)
+    (versions / "0003_destructive.py").write_text(
+        "from alembic import op\n"
+        "def upgrade():\n"
+        "    op.alter_column('employees', 'state', nullable=True)\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "infra/scripts/check-migrations.py")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "op.alter_column is not allowed" in result.stderr
 
 
 def test_employee_whatsapp_constraint_migrates_to_active_only(tmp_path) -> None:
