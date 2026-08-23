@@ -12,6 +12,8 @@ test("pilot infrastructure keeps the approved low-cost security boundaries", asy
   const template = await source("infra/cloudformation/pilot.yaml");
 
   assert.match(template, /Default: t4g\.small/);
+  assert.match(template, /Default: fieldintel\.svabhu\.co\.in/);
+  assert.doesNotMatch(template, /fieldintel\.svabhu\.com/);
   assert.match(template, /CpuCredits: standard/);
   assert.match(template, /HttpTokens: required/);
   assert.match(template, /HttpPutResponseHopLimit: 2/);

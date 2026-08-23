@@ -1,7 +1,7 @@
 # Pilot infrastructure
 
 This directory contains code-only infrastructure for
-`fieldintel.svabhu.com`. Creating or updating live AWS resources is a separate,
+`fieldintel.svabhu.co.in`. Creating or updating live AWS resources is a separate,
 explicitly approved step.
 
 ## Stack layout
