@@ -176,7 +176,7 @@ Resources:
 
   StorageBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
@@ -249,7 +249,7 @@ Resources:
 
   ApplicationRepository:
     Type: AWS::ECR::Repository
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
@@ -273,7 +273,7 @@ Resources:
 
   InstanceLogGroup:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
@@ -291,7 +291,7 @@ Resources:
 
   AlarmKey:
     Type: AWS::KMS::Key
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
@@ -538,9 +538,14 @@ Resources:
             }
             trap signal_failure EXIT
 
-            dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq curl iptables-nft
+            # Amazon Linux 2023 ships curl-minimal, which provides the curl CLI.
+            # Installing the full curl package alongside it causes a DNF conflict
+            # on current AMIs and aborts the CloudFormation bootstrap.
+            dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft
             install -d -m 0755 /usr/local/libexec/docker/cli-plugins
             curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors --retry-max-time 300 \
+              --connect-timeout 10 --max-time 120 \
               https://github.com/docker/compose/releases/download/v5.4.0/docker-compose-linux-aarch64 \
               --output /usr/local/libexec/docker/cli-plugins/docker-compose
             echo 'fc5d1371f1ec7987e703da94ede49af3fbfb240b83f22991a98511de7bc4b93b  /usr/local/libexec/docker/cli-plugins/docker-compose' | sha256sum --check --strict
@@ -749,7 +754,7 @@ Resources:
 
   DataVolume:
     Type: AWS::EC2::Volume
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:
@@ -818,7 +823,7 @@ Resources:
 
   ElasticIp:
     Type: AWS::EC2::EIP
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Metadata:
       com.aws.cloudformation.Context:

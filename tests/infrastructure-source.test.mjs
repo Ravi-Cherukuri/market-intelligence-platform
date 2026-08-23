@@ -25,6 +25,10 @@ test("pilot infrastructure keeps the approved low-cost security boundaries", asy
   assert.match(template, /CreationPolicy:[\s\S]*?ResourceSignal:/);
   assert.match(template, /DataVolumeMountAssociation:/);
   assert.match(template, /WaitForSuccessTimeoutSeconds: 900/);
+  assert.match(template, /dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft/);
+  assert.doesNotMatch(template, /dnf install[^\n]*\bcurl\b/);
+  assert.match(template, /--retry 5 --retry-all-errors --retry-max-time 300/);
+  assert.match(template, /--connect-timeout 10 --max-time 120/);
   assert.doesNotMatch(template, /FromPort: 22|ToPort: 22/);
   assert.doesNotMatch(template, /WHATSAPP_ACCESS_TOKEN|OPENAI_API_KEY|ADMIN_PASSWORD/);
 });
@@ -32,7 +36,9 @@ test("pilot infrastructure keeps the approved low-cost security boundaries", asy
 test("stateful infrastructure is retained and private", async () => {
   const template = await source("infra/cloudformation/pilot.yaml");
 
-  assert.match(template, /StorageBucket:\n[\s\S]*?DeletionPolicy: Retain/);
+  assert.match(template, /StorageBucket:\n[\s\S]*?DeletionPolicy: RetainExceptOnCreate/);
+  assert.equal((template.match(/DeletionPolicy: RetainExceptOnCreate/g) ?? []).length, 6);
+  assert.equal((template.match(/UpdateReplacePolicy: Retain/g) ?? []).length, 6);
   assert.match(template, /BlockPublicAcls: true/);
   assert.match(template, /BlockPublicPolicy: true/);
   assert.match(template, /IgnorePublicAcls: true/);
