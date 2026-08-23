@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Field intelligence pilot release builder - an isolated, on-demand native
+  ARM64 build environment with least-privilege publishing access
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: versioned S3 source -> ephemeral CodeBuild -> immutable ECR images and checksummed S3 release
+    must:
+      - no runtime provider secrets
+      - no EC2, SSM, IAM, or CloudFormation permissions in the build role
+      - build publishes but never activates a release
+      - deploy in the same region as the pilot stack
+    ref:
+      - at: ../architecture.md
+        has: pilot scope, cost choices, recovery limits
+        scope: shared
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: pilot
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  PilotStackName:
+    Type: String
+    Default: fieldintel-pilot
+    AllowedPattern: '^[A-Za-z][-A-Za-z0-9]{0,127}$'
+  StorageBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  ApplicationRepositoryName:
+    Type: String
+    AllowedPattern: '^[a-z0-9]+(?:[._/-][a-z0-9]+)*$'
+  ApplicationRepositoryUri:
+    Type: String
+    AllowedPattern: '^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9._/-]+$'
+  OperationsKeyArn:
+    Type: String
+    AllowedPattern: '^arn:[a-z0-9-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$'
+  SourceObjectKey:
+    Type: String
+    Default: build-sources/source.zip
+    AllowedValues:
+      - build-sources/source.zip
+
+Resources:
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: bounded encrypted logs for the ephemeral ARM64 application builder
+        must:
+          - never place application or provider secrets in build commands or logs
+        mutable: free-to-tune
+    Properties:
+      KmsKeyId: !Ref OperationsKeyArn
+      LogGroupName: !Sub '/fieldintel/${PilotStackName}/build'
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolate privileged build credentials from both the production host and human operator
+        must:
+          - source reads and release writes stay within the pilot bucket
+          - image access stays within the pilot repository except for the required ECR auth token
+          - no runtime provider secrets or deployment permissions
+        mutable: review-required
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-build'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${PilotStackName}-application'
+      Policies:
+        - PolicyName: PilotBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InspectSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${StorageBucketName}'
+              - Sid: ReadVersionedBuildSource
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${StorageBucketName}/${SourceObjectKey}'
+              - Sid: WriteReleaseBundle
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${StorageBucketName}/releases/*'
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PushAndVerifyReleaseImages
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeImageScanFindings
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ApplicationRepositoryName}'
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt BuildLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ApplicationBuildProject:
+    Type: AWS::CodeBuild::Project
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: ephemeral native ARM64 image builds without Docker or push credentials on the production host
+        must:
+          - remain on-demand with no reserved fleet or persistent cache
+          - consume the exact versioned S3 archive chosen by the release operator
+          - publish only; deployment remains a separate explicit action
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub '${PilotStackName}-application'
+      Description: Build immutable ARM64 FieldIntel images and package a host release
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source:
+        Type: S3
+        Location: !Sub '${StorageBucketName}/${SourceObjectKey}'
+        BuildSpec: infra/codebuild/buildspec.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Cache:
+        Type: NO_CACHE
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPOSITORY_URI
+            Type: PLAINTEXT
+            Value: !Ref ApplicationRepositoryUri
+          - Name: STORAGE_BUCKET
+            Type: PLAINTEXT
+            Value: !Ref StorageBucketName
+          - Name: SOURCE_OBJECT_KEY
+            Type: PLAINTEXT
+            Value: !Ref SourceObjectKey
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+          StreamName: application
+        S3Logs:
+          Status: DISABLED
+      ConcurrentBuildLimit: 1
+      QueuedTimeoutInMinutes: 15
+      TimeoutInMinutes: 45
+      Visibility: PRIVATE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  ApplicationBuildProjectName:
+    Description: On-demand ARM64 CodeBuild project used by the reviewed release workflow
+    Value: !Ref ApplicationBuildProject
+  BuildLogGroupName:
+    Description: Encrypted CloudWatch log group for build diagnostics
+    Value: !Ref BuildLogGroup

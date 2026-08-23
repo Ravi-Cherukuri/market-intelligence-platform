@@ -61,6 +61,60 @@ test("stateful infrastructure is retained and private", async () => {
   assert.doesNotMatch(template, /Resource: !Sub '\$\{StorageBucket\.Arn\}\/\*'/);
 });
 
+test("managed release builds are bounded, native ARM64, and least privilege", async () => {
+  const template = await source("infra/cloudformation/builder.yaml");
+  const buildspec = await source("infra/codebuild/buildspec.yml");
+  const starter = await source("infra/scripts/start-managed-build.sh");
+  const build = await source("infra/scripts/build-release.sh");
+
+  assert.match(template, /ApplicationBuildProject:\n\s+Type: AWS::CodeBuild::Project/);
+  assert.doesNotMatch(template, /AWS::EC2::Instance|AWS::S3::Bucket|AWS::ECR::Repository/);
+  assert.match(template, /Service: codebuild\.amazonaws\.com/);
+  assert.match(template, /aws:SourceAccount: !Ref AWS::AccountId/);
+  assert.match(template, /aws:SourceArn:/);
+  assert.match(template, /Type: ARM_CONTAINER/);
+  assert.match(template, /ComputeType: BUILD_GENERAL1_SMALL/);
+  assert.match(template, /Image: aws\/codebuild\/amazonlinux-aarch64-standard:3\.0/);
+  assert.match(template, /PrivilegedMode: true/);
+  assert.match(template, /ConcurrentBuildLimit: 1/);
+  assert.match(template, /QueuedTimeoutInMinutes: 15/);
+  assert.match(template, /TimeoutInMinutes: 45/);
+  assert.match(template, /Visibility: PRIVATE/);
+  assert.match(template, /StorageBucketName\}\/\$\{SourceObjectKey\}'/);
+  assert.match(template, /StorageBucketName\}\/releases\/\*'/);
+  assert.match(template, /repository\/\$\{ApplicationRepositoryName\}'/);
+  assert.doesNotMatch(template, /s3:DeleteObject|ecr:\*/);
+  assert.doesNotMatch(template, /ssm:|ec2:|cloudformation:|iam:/);
+  assert.doesNotMatch(template, /codeconnections:|github\.com\/Ravi-Cherukuri/);
+  assert.doesNotMatch(template, /Name: (WHATSAPP_ACCESS_TOKEN|OPENAI_API_KEY|ADMIN_PASSWORD)/);
+  assert.match(buildspec, /docker info/);
+  assert.match(buildspec, /docker buildx version/);
+  assert.match(buildspec, /test "\$\(uname -m\)" = "aarch64"/);
+  assert.match(buildspec, /SOURCE_COMMIT:0:12.*CODEBUILD_BUILD_ID/);
+  assert.match(buildspec, /CODEBUILD_SOURCE_VERSION/);
+  assert.match(buildspec, /source-sha256/);
+  assert.match(buildspec, /releases\/\$RELEASE_ID\/source\.zip/);
+  assert.match(buildspec, /PYTHONPATH=backend.*pytest backend\/tests/);
+  assert.match(buildspec, /pnpm test/);
+  assert.match(buildspec, /pnpm lint/);
+  assert.match(buildspec, /pnpm build/);
+  assert.match(buildspec, /build-release\.sh "\$ECR_REPOSITORY_URI" "\$RELEASE_ID"/);
+  assert.match(buildspec, /package-release\.sh "\$RELEASE_ID" "\$STORAGE_BUCKET"/);
+  assert.doesNotMatch(buildspec, /deploy-release|activate-release|ssm send-command/);
+  assert.ok(
+    buildspec.indexOf("releases/$RELEASE_ID/source.zip") < buildspec.indexOf("package-release.sh"),
+    "retained source must upload before the release checksum commit marker",
+  );
+  assert.match(starter, /git status --porcelain --untracked-files=normal/);
+  assert.match(starter, /git archive --format=zip/);
+  assert.match(starter, /--source-version "\$SOURCE_VERSION"/);
+  assert.doesNotMatch(starter, /environment-variables-override/);
+  assert.match(starter, /codebuild batch-get-builds/);
+  assert.match(starter, /seq 1 390/);
+  assert.match(starter, /FAILED\|FAULT\|STOPPED\|TIMED_OUT/);
+  assert.match(build, /SOURCE_COMMIT must identify the archived Git commit/);
+});
+
 test("production releases use ARM64 ECR digests with health-checked rollback", async () => {
   const compose = await source("docker-compose.production.yml");
   const build = await source("infra/scripts/build-release.sh");

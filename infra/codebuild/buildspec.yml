@@ -1,0 +1,53 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    on-failure: ABORT
+    runtime-versions:
+      nodejs: 22
+      python: 3.12
+    commands:
+      - set -euo pipefail
+      - test -n "${STORAGE_BUCKET:-}"
+      - test "${SOURCE_OBJECT_KEY:-}" = "build-sources/source.zip"
+      - test -n "${CODEBUILD_SOURCE_VERSION:-}"
+      - SOURCE_METADATA=$(aws s3api get-object --bucket "$STORAGE_BUCKET" --key "$SOURCE_OBJECT_KEY" --version-id "$CODEBUILD_SOURCE_VERSION" /tmp/fieldintel-source.zip --query Metadata --output json)
+      - export SOURCE_COMMIT=$(jq -er '."source-commit"' <<<"$SOURCE_METADATA")
+      - export SOURCE_ARCHIVE_SHA256=$(jq -er '."source-sha256"' <<<"$SOURCE_METADATA")
+      - '[[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]'
+      - '[[ "$SOURCE_ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]]'
+      - test "$(tr -d '\r\n' <.fieldintel-source-commit)" = "$SOURCE_COMMIT"
+      - test "$(sha256sum /tmp/fieldintel-source.zip | awk '{print $1}')" = "$SOURCE_ARCHIVE_SHA256"
+      - corepack enable
+      - pnpm install --frozen-lockfile
+      - python3 -m venv /tmp/fieldintel-venv
+      - /tmp/fieldintel-venv/bin/pip install --disable-pip-version-check -r backend/requirements.txt
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - set -euo pipefail
+      - test -n "${ECR_REPOSITORY_URI:-}"
+      - test -n "${STORAGE_BUCKET:-}"
+      - '[[ "${CODEBUILD_BUILD_ID:-}" =~ :[a-f0-9-]{36}$ ]]'
+      - test "$(uname -m)" = "aarch64"
+      - docker info
+      - docker buildx version
+      - PYTHONPATH=backend /tmp/fieldintel-venv/bin/pytest backend/tests
+      - pnpm test
+      - pnpm lint
+      - pnpm build
+  build:
+    on-failure: ABORT
+    commands:
+      - set -euo pipefail
+      - export SOURCE_COMMIT=$(tr -d '\r\n' <.fieldintel-source-commit)
+      - export SOURCE_VERSION="$CODEBUILD_SOURCE_VERSION"
+      - export SOURCE_ARCHIVE_SHA256=$(sha256sum /tmp/fieldintel-source.zip | awk '{print $1}')
+      - export BUILD_ARN="$CODEBUILD_BUILD_ARN"
+      - export RELEASE_ID="${SOURCE_COMMIT:0:12}-${CODEBUILD_BUILD_ID##*:}"
+      - infra/scripts/build-release.sh "$ECR_REPOSITORY_URI" "$RELEASE_ID"
+      - aws s3 cp /tmp/fieldintel-source.zip "s3://$STORAGE_BUCKET/releases/$RELEASE_ID/source.zip" --region "$AWS_DEFAULT_REGION" --only-show-errors
+      - infra/scripts/package-release.sh "$RELEASE_ID" "$STORAGE_BUCKET" "$AWS_DEFAULT_REGION"

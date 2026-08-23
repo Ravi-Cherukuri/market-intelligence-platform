@@ -19,10 +19,30 @@ fi
 REGISTRY=${REPOSITORY_URI%%/*}
 REPOSITORY_NAME=${REPOSITORY_URI#*/}
 REGION=$(awk -F. '{print $4}' <<<"$REGISTRY")
-SOURCE_COMMIT=$(git rev-parse HEAD)
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "Refusing to release a dirty working tree" >&2
-  exit 1
+PROVIDED_SOURCE_COMMIT=${SOURCE_COMMIT:-}
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  SOURCE_COMMIT=$(git rev-parse HEAD)
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Refusing to release a dirty working tree" >&2
+    exit 1
+  fi
+else
+  SOURCE_COMMIT=$PROVIDED_SOURCE_COMMIT
+fi
+if [[ ! "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "SOURCE_COMMIT must identify the archived Git commit" >&2
+  exit 2
+fi
+SOURCE_VERSION=${SOURCE_VERSION:-}
+SOURCE_ARCHIVE_SHA256=${SOURCE_ARCHIVE_SHA256:-}
+BUILD_ARN=${BUILD_ARN:-}
+if [[ -n "$SOURCE_VERSION$SOURCE_ARCHIVE_SHA256$BUILD_ARN" ]]; then
+  [[ -n "$SOURCE_VERSION" ]] || { echo "SOURCE_VERSION is required for managed builds" >&2; exit 2; }
+  [[ "$SOURCE_ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo "Invalid source archive checksum" >&2; exit 2; }
+  [[ "$BUILD_ARN" =~ ^arn:[a-z0-9-]+:codebuild:[a-z0-9-]+:[0-9]{12}:build/[A-Za-z0-9_-]+:[a-f0-9-]{36}$ ]] || {
+    echo "Invalid CodeBuild build ARN" >&2
+    exit 2
+  }
 fi
 python3 infra/scripts/check-migrations.py
 
@@ -83,11 +103,14 @@ mkdir -p dist/releases
 jq -n \
   --arg release_id "$RELEASE_ID" \
   --arg source_commit "$SOURCE_COMMIT" \
+  --arg source_version "$SOURCE_VERSION" \
+  --arg source_archive_sha256 "$SOURCE_ARCHIVE_SHA256" \
+  --arg build_arn "$BUILD_ARN" \
   --arg api_image "$REPOSITORY_URI@$API_DIGEST" \
   --arg web_image "$REPOSITORY_URI@$WEB_DIGEST" \
   --arg postgres_image "$REPOSITORY_URI@$POSTGRES_DIGEST" \
   --arg caddy_image "$REPOSITORY_URI@$CADDY_DIGEST" \
-  '{release_id:$release_id,source_commit:$source_commit,platform:"linux/arm64",api_image:$api_image,web_image:$web_image,postgres_image:$postgres_image,caddy_image:$caddy_image}' \
+  '{release_id:$release_id,source_commit:$source_commit,source_version:$source_version,source_archive_sha256:$source_archive_sha256,build_arn:$build_arn,platform:"linux/arm64",api_image:$api_image,web_image:$web_image,postgres_image:$postgres_image,caddy_image:$caddy_image}' \
   >"dist/releases/$RELEASE_ID.json"
 
 echo "Release manifest: dist/releases/$RELEASE_ID.json"

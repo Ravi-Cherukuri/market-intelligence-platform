@@ -8,6 +8,8 @@ explicitly approved step.
 
 - `cloudformation/pilot.yaml` - Mumbai VPC, EC2 host, EIP, encrypted storage,
   ECR, SSM access, snapshots, logs and alarms.
+- `cloudformation/builder.yaml` - isolated on-demand ARM64 CodeBuild project
+  with narrowly scoped release-publishing permissions and encrypted logs.
 - `cloudformation/budget.yaml` - account-level monthly cost notifications,
   deployed in `us-east-1`.
 - `architecture.md` - design constraints and recovery limits shared by both
@@ -18,14 +20,29 @@ explicitly approved step.
 
 ## Deployment order
 
-1. Validate both templates locally.
-2. Create non-executed CloudFormation change sets.
+1. Validate all CloudFormation templates locally.
+2. Create non-executed CloudFormation change sets for the pilot and builder stacks.
 3. Review the change sets and estimated charges.
-4. After explicit approval, execute the budget stack and then the pilot stack.
+4. After explicit approval, execute the budget stack, pilot stack, and then the
+   builder stack.
 5. Confirm the SNS email subscription.
 6. Add a GoDaddy A record: host `fieldintel`, value from the
    `ElasticIpAddress` stack output, TTL 600 seconds.
 7. Deploy the checksummed, IAM-controlled application release and configure runtime secrets.
+
+After the reviewed builder stack has been deployed, start a release from a
+clean, committed checkout with:
+
+```bash
+infra/scripts/start-managed-build.sh fieldintel-pilot-builder
+```
+
+The script archives only Git-tracked files, uploads one versioned source object
+to the private stack bucket, and starts the on-demand build against that exact
+S3 object version. The Git commit and release identifier are non-secret build
+inputs. Runtime provider credentials are never sent to CodeBuild. The builder
+publishes immutable ARM64 images to the stack repository and a checksummed host
+release bundle under `releases/<release-id>/`.
 
 The package checksum detects transfer corruption. Release write access is
 restricted by IAM and S3 versioning; the pilot does not yet implement a

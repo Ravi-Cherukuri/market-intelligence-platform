@@ -202,6 +202,12 @@ Resources:
             Prefix: releases/
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
+          - Id: ExpireBuildSources
+            Status: Enabled
+            Prefix: build-sources/
+            ExpirationInDays: 14
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
           - Id: ExpireDatabaseBackups
             Status: Enabled
             Prefix: backups/database/
@@ -336,7 +342,7 @@ Resources:
             Resource: '*'
             Condition:
               ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/fieldintel/${AWS::StackName}/host*'
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/fieldintel/${AWS::StackName}/*'
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -1045,6 +1051,12 @@ Outputs:
   ApplicationRepositoryUri:
     Description: Private ECR repository for ARM64 application images
     Value: !GetAtt ApplicationRepository.RepositoryUri
+  ApplicationRepositoryName:
+    Description: Repository name passed to the separately managed builder stack
+    Value: !Ref ApplicationRepository
+  OperationsKeyArn:
+    Description: KMS key used by the separately managed builder log group
+    Value: !GetAtt AlarmKey.Arn
   AlarmTopicArn:
     Description: SNS topic used by operational alarms
     Value: !Ref AlarmTopic
