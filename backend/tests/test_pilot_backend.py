@@ -1,0 +1,825 @@
+"""Acceptance tests for the foundation of field-intelligence ingestion.
+
+The fixtures model Meta webhook deliveries rather than calling private route
+helpers. They make replay, sender privacy, conversation and company-boundary
+requirements executable without a Meta account or paid AI calls.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+import pytest
+
+from app.domain.conversations import belongs_to_open_conversation, normalized_command
+from app.domain.identity import InvalidPhoneNumber, normalize_indian_whatsapp_number
+from app.domain.signals import EvidenceIdentity, classify_strength
+from app.ai.model_router import ModelRouter, QualityTier, TaskType
+from app.models import (
+    AuditEvent,
+    Company,
+    ConversationStatus,
+    Employee,
+    EmploymentType,
+    FieldConversation,
+    FieldMessage,
+    MediaAsset,
+    MessageType,
+    OutboundMessage,
+    Observation,
+    Product,
+    ProductOwnership,
+    CompetitionPrice,
+    SignalStrength,
+    WhatsAppChannel,
+)
+from app.security import verify_meta_signature
+from app.services.imports import (
+    commit_employees,
+    commit_prices,
+    preview_employees,
+    preview_prices,
+)
+from app.services.ingestion import ingest_whatsapp_message
+from app.services.signals import upsert_signal
+from app.integrations.whatsapp import DownloadedMedia
+import app.worker as worker
+
+
+BASE_TIME = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+
+
+def epoch(value: datetime) -> str:
+    return str(int(value.timestamp()))
+
+
+def meta_message(
+    *,
+    message_id: str,
+    sender: str = "9876543210",
+    timestamp: datetime = BASE_TIME,
+    text: str = "Competitor price increased in Maharashtra",
+) -> dict[str, Any]:
+    return {
+        "id": message_id,
+        "from": sender,
+        "timestamp": epoch(timestamp),
+        "type": "text",
+        "text": {"body": text},
+    }
+
+
+def meta_payload(phone_number_id: str, message: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "test-waba",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": phone_number_id},
+                            "messages": [message],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def signed_json(payload: dict[str, Any], secret: str = "test-app-secret") -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return body, {"X-Hub-Signature-256": f"sha256={digest}", "Content-Type": "application/json"}
+
+
+def seed_company(
+    session: Session,
+    *,
+    name: str,
+    phone_number_id: str,
+    sender: str = "919876543210",
+    employee_code: str = "EMP-001",
+) -> tuple[Company, WhatsAppChannel, Employee]:
+    company = Company(name=name)
+    session.add(company)
+    session.flush()
+    channel = WhatsAppChannel(company_id=company.id, phone_number_id=phone_number_id)
+    employee = Employee(
+        company_id=company.id,
+        employee_code=employee_code,
+        employment_type=EmploymentType.FULL_TIME,
+        state="Maharashtra",
+        whatsapp_number=sender,
+    )
+    session.add_all([channel, employee])
+    session.commit()
+    return company, channel, employee
+
+
+def test_identity_normalizes_common_indian_mobile_formats_and_rejects_invalid_values() -> None:
+    assert normalize_indian_whatsapp_number("98765 43210") == "919876543210"
+    assert normalize_indian_whatsapp_number("+91-98765-43210") == "919876543210"
+    assert normalize_indian_whatsapp_number("919876543210") == "919876543210"
+
+    for invalid in ("", "0000000000", "12345", "1234567890", "1234567890123456"):
+        try:
+            normalize_indian_whatsapp_number(invalid)
+        except InvalidPhoneNumber:
+            pass
+        else:  # pragma: no cover - explicit failure makes the policy obvious.
+            raise AssertionError(f"expected {invalid!r} to be rejected")
+
+
+def test_conversation_window_and_commands_are_intentionally_exact() -> None:
+    assert belongs_to_open_conversation(BASE_TIME, BASE_TIME + timedelta(minutes=29, seconds=59), 30)
+    assert not belongs_to_open_conversation(BASE_TIME, BASE_TIME + timedelta(minutes=30), 30)
+    assert normalized_command("  DONE ") == "done"
+    assert normalized_command("new   report") == "new_report"
+    assert normalized_command("done, price is 100") is None
+
+
+def test_signal_strength_requires_distinct_employees_not_message_volume() -> None:
+    same_employee = [
+        EvidenceIdentity("employee-a", "conversation-1"),
+        EvidenceIdentity("employee-a", "conversation-1"),
+        EvidenceIdentity("employee-a", "conversation-2"),
+    ]
+    assert classify_strength(same_employee) == ("weak", 1, 2)
+    corroborated = same_employee + [EvidenceIdentity("employee-b", "conversation-3")]
+    assert classify_strength(corroborated) == ("strong", 2, 3)
+
+
+def test_meta_signature_requires_valid_sha256_signature() -> None:
+    body = b'{"entry":[]}'
+    signature = "sha256=" + hmac.new(b"test-app-secret", body, hashlib.sha256).hexdigest()
+    assert verify_meta_signature(body, signature, "test-app-secret")
+    assert not verify_meta_signature(body, "sha256=deadbeef", "test-app-secret")
+    assert not verify_meta_signature(body, signature, "other-secret")
+    assert not verify_meta_signature(body, None, "test-app-secret")
+    assert not verify_meta_signature(body, signature, "")
+
+
+def test_meta_webhook_challenge_accepts_only_configured_token(client: TestClient) -> None:
+    url = "/api/v1/webhooks/whatsapp"
+    accepted = client.get(url, params={"hub.mode": "subscribe", "hub.verify_token": "test-verify-token", "hub.challenge": "challenge"})
+    rejected = client.get(url, params={"hub.mode": "subscribe", "hub.verify_token": "wrong", "hub.challenge": "challenge"})
+
+    assert accepted.status_code == 200
+    assert accepted.text == "challenge"
+    assert rejected.status_code == 403
+
+
+def test_rejects_invalid_signature_without_persisting_content(client: TestClient, db_session: Session) -> None:
+    seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    body = json.dumps(meta_payload("channel-one", meta_message(message_id="wamid-invalid-signature"))).encode()
+
+    response = client.post(
+        "/api/v1/webhooks/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": "sha256=not-valid", "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 401
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 0
+    assert db_session.scalar(select(func.count()).select_from(AuditEvent)) == 0
+
+
+def test_authenticated_webhook_is_idempotent_across_meta_retries(client: TestClient, db_session: Session) -> None:
+    seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    body, headers = signed_json(meta_payload("channel-one", meta_message(message_id="wamid-retry")))
+
+    first = client.post("/api/v1/webhooks/whatsapp", content=body, headers=headers)
+    second = client.post("/api/v1/webhooks/whatsapp", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert first.json()["messages_persisted"] == 1
+    assert second.status_code == 200
+    assert second.json()["messages_persisted"] == 0
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 1
+    assert db_session.scalar(select(func.count()).select_from(FieldConversation)) == 1
+
+
+def test_document_attachment_is_rejected_without_creating_media_work(db_session: Session) -> None:
+    _, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    document = {
+        "id": "wamid-document",
+        "from": "9876543210",
+        "timestamp": epoch(BASE_TIME),
+        "type": "document",
+        "document": {"id": "provider-document-id", "filename": "price-list.xlsx"},
+    }
+
+    result = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=document,
+        timeout_minutes=30,
+    )
+    db_session.commit()
+    stored = db_session.scalar(
+        select(FieldMessage).where(FieldMessage.provider_message_id == "wamid-document")
+    )
+
+    assert result.status == "accepted"
+    assert stored is not None
+    assert stored.message_type == MessageType.UNSUPPORTED
+    assert stored.provider_media_id is None
+    assert db_session.scalar(select(func.count()).select_from(MediaAsset)) == 0
+    assert db_session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+
+
+@pytest.mark.parametrize(
+    ("media_type", "mime_type"),
+    [("audio", "audio/ogg"), ("image", "image/jpeg")],
+)
+def test_pilot_media_is_stored_as_unscanned_without_local_decoding(
+    db_session: Session,
+    session_factory,
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+    media_type: str,
+    mime_type: str,
+) -> None:
+    """The 2 GiB pilot may retain voice/photos, but must not run ClamAV or AI.
+
+    This uses fake provider and S3 boundaries: no external API call or AWS
+    credential lookup is permitted during the worker test.
+    """
+    company, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    provider_media_id = f"provider-{media_type}-id"
+    result = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message={
+            "id": f"wamid-{media_type}",
+            "from": "9876543210",
+            "timestamp": epoch(BASE_TIME),
+            "type": media_type,
+            media_type: {"id": provider_media_id},
+        },
+        timeout_minutes=30,
+    )
+    db_session.commit()
+    assert result.status == "accepted"
+    asset_id = db_session.scalar(select(MediaAsset.id).where(MediaAsset.provider_media_id == provider_media_id))
+    assert asset_id is not None
+
+    stored: dict[str, object] = {}
+
+    class FakeWhatsAppClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def download_media(self, media_id: str) -> DownloadedMedia:
+            assert media_id == provider_media_id
+            return DownloadedMedia(content=b"safe pilot media", mime_type=mime_type, provider_sha256=None)
+
+    class FakeMediaStore:
+        def __init__(self, bucket: str, region: str) -> None:
+            stored["bucket"] = bucket
+            stored["region"] = region
+
+        def put_inbound_media(self, **kwargs: object) -> tuple[str, str]:
+            stored.update(kwargs)
+            return f"companies/{company.id}/inbound/test/{provider_media_id}", "test-digest"
+
+    class NoAiClient:
+        def __init__(self, *_: object) -> None:
+            raise AssertionError("AI must not run when OPENAI_API_KEY is absent")
+
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker, "WhatsAppClient", FakeWhatsAppClient)
+    monkeypatch.setattr(worker, "S3MediaStore", FakeMediaStore)
+    monkeypatch.setattr(worker, "OpenAIIntelligenceClient", NoAiClient)
+
+    assert worker.process_media_assets() == 1
+    db_session.expire_all()
+    asset = db_session.get(MediaAsset, asset_id)
+    message = db_session.get(FieldMessage, result.message_id)
+    assert asset is not None
+    assert asset.scan_status == "accepted_unscanned_pilot"
+    assert asset.analysis_status == "waiting"
+    assert asset.object_key == f"companies/{company.id}/inbound/test/{provider_media_id}"
+    assert asset.mime_type == mime_type
+    assert asset.sha256 == "test-digest"
+    assert message is not None
+    assert message.derived_text is None
+    assert stored["company_id"] == company.id
+    assert stored["media_id"] == provider_media_id
+    assert stored["content"] == b"safe pilot media"
+
+
+def test_unknown_sender_discards_message_and_media_but_keeps_minimal_audit_event(
+    client: TestClient, db_session: Session
+) -> None:
+    company, _, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    field_content = "Private field observation that must never be retained"
+    payload = meta_payload(
+        "channel-one",
+        meta_message(message_id="wamid-unknown", sender="9123456789", text=field_content),
+    )
+    body, headers = signed_json(payload)
+
+    response = client.post("/api/v1/webhooks/whatsapp", content=body, headers=headers)
+    audit = db_session.scalar(select(AuditEvent).where(AuditEvent.event_type == "whatsapp.unregistered_sender"))
+
+    assert response.status_code == 200
+    assert response.json()["messages_persisted"] == 0
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 0
+    assert audit is not None
+    assert audit.company_id == company.id
+    assert audit.actor_reference != "9123456789"
+    assert field_content not in json.dumps(audit.metadata_json)
+    assert db_session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+
+
+def test_destination_number_segregates_same_sender_between_companies(client: TestClient, db_session: Session) -> None:
+    company_a, _, employee_a = seed_company(
+        db_session, name="Company A", phone_number_id="channel-a", employee_code="A-001"
+    )
+    company_b, _, employee_b = seed_company(
+        db_session, name="Company B", phone_number_id="channel-b", employee_code="B-001"
+    )
+    assert employee_a.whatsapp_number == employee_b.whatsapp_number
+
+    body_a, headers_a = signed_json(meta_payload("channel-a", meta_message(message_id="wamid-a")))
+    body_b, headers_b = signed_json(meta_payload("channel-b", meta_message(message_id="wamid-b")))
+    assert client.post("/api/v1/webhooks/whatsapp", content=body_a, headers=headers_a).status_code == 200
+    assert client.post("/api/v1/webhooks/whatsapp", content=body_b, headers=headers_b).status_code == 200
+
+    messages = db_session.scalars(select(FieldMessage).order_by(FieldMessage.provider_message_id)).all()
+    conversations = db_session.scalars(select(FieldConversation).order_by(FieldConversation.company_id)).all()
+    assert [(message.company_id, message.employee_id) for message in messages] == [
+        (company_a.id, employee_a.id),
+        (company_b.id, employee_b.id),
+    ]
+    assert {conversation.company_id for conversation in conversations} == {company_a.id, company_b.id}
+    conversations_by_id = {conversation.id: conversation for conversation in conversations}
+    assert all(
+        message.company_id == conversations_by_id[message.conversation_id].company_id
+        for message in messages
+    )
+
+
+def test_inactivity_boundary_and_done_close_a_conversation(db_session: Session) -> None:
+    company, channel, employee = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    first = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-first", timestamp=BASE_TIME),
+        timeout_minutes=30,
+    )
+    second = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-before-boundary", timestamp=BASE_TIME + timedelta(minutes=29, seconds=59)),
+        timeout_minutes=30,
+    )
+    exact_boundary = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-boundary", timestamp=BASE_TIME + timedelta(minutes=59, seconds=59)),
+        timeout_minutes=30,
+    )
+    done = ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-done", timestamp=BASE_TIME + timedelta(minutes=60), text="Done"),
+        timeout_minutes=30,
+    )
+    db_session.commit()
+
+    first_conversation = db_session.get(FieldConversation, first.conversation_id)
+    second_conversation = db_session.get(FieldConversation, exact_boundary.conversation_id)
+    assert first.conversation_id == second.conversation_id
+    assert exact_boundary.conversation_id != first.conversation_id
+    assert first_conversation.status == ConversationStatus.CLOSED
+    assert first_conversation.close_reason == "inactivity"
+    assert second_conversation.status == ConversationStatus.CLOSED
+    assert second_conversation.close_reason == "done"
+    assert done.status == "conversation_closed"
+    assert db_session.scalar(select(func.count()).select_from(FieldMessage)) == 3
+    assert db_session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.company_id == company.id)) == 1
+    assert employee.id == second_conversation.employee_id
+
+
+def test_done_command_delivery_is_idempotent(db_session: Session) -> None:
+    """Meta can retry a command delivery just like an evidence message.
+
+    A retry may not add a second audit event or cause a second state transition.
+    """
+    company, channel, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    ingest_whatsapp_message(
+        db_session,
+        phone_number_id=channel.phone_number_id,
+        message=meta_message(message_id="wamid-open", timestamp=BASE_TIME),
+        timeout_minutes=30,
+    )
+    done_message = meta_message(message_id="wamid-done-retry", timestamp=BASE_TIME + timedelta(minutes=1), text="Done")
+    first = ingest_whatsapp_message(
+        db_session, phone_number_id=channel.phone_number_id, message=done_message, timeout_minutes=30
+    )
+    # The production webhook commits one delivery before Meta can retry it.
+    db_session.commit()
+    second = ingest_whatsapp_message(
+        db_session, phone_number_id=channel.phone_number_id, message=done_message, timeout_minutes=30
+    )
+    db_session.commit()
+
+    assert first.status == "conversation_closed"
+    assert second.status == "duplicate"
+    assert db_session.scalar(
+        select(func.count()).select_from(AuditEvent).where(
+            AuditEvent.company_id == company.id,
+            AuditEvent.event_type == "conversation.done",
+        )
+    ) == 1
+
+
+def test_employee_import_preview_reports_errors_and_never_partially_commits(db_session: Session) -> None:
+    company, _, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    preview = preview_employees(
+        [
+            {
+                "Employee Code": "EMP-NEW",
+                "Employment Type": "Full Time",
+                "State": "Maharashtra",
+                "WhatsApp Phone Number": "9876543210",
+            },
+            {
+                "Employee Code": "EMP-NEW",
+                "Employment Type": "incorrect type",
+                "State": "",
+                "WhatsApp Phone Number": "12345",
+            },
+        ]
+    )
+
+    assert not preview.as_dict()["valid"]
+    assert {error.field for error in preview.errors} >= {"employee_code", "employment_type", "state", "whatsapp_number"}
+    try:
+        commit_employees(db_session, company.id, preview)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid preview must not be commit-able")
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 1
+
+
+def test_employee_master_api_previews_then_atomically_commits(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Imports")
+    db_session.add(company)
+    db_session.commit()
+    content = (
+        "employee_code,employment_type,designation,territory_code,state,email,whatsapp_number,active\n"
+        "EMP-101,full_time,Field Officer,FOT-MH-01,Maharashtra,,9876543210,true\n"
+        "EMP-102,contractual,Field Associate,FOT-GJ-02,Gujarat,field@example.com,+91 91234 56789,true\n"
+    ).encode()
+    endpoint = f"/api/v1/admin/companies/{company.id}/masters/employees"
+
+    preview_response = client.post(
+        f"{endpoint}/preview",
+        files={"file": ("employees.csv", content, "text/csv")},
+        auth=("Admin", "Password"),
+    )
+    assert preview_response.status_code == 200
+    assert preview_response.json()["valid"] is True
+    assert preview_response.json()["row_count"] == 2
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+    commit_response = client.post(
+        f"{endpoint}/commit",
+        files={"file": ("employees.csv", content, "text/csv")},
+        auth=("Admin", "Password"),
+    )
+    assert commit_response.status_code == 200
+    assert commit_response.json() == {"valid": True, "committed": 2, "errors": []}
+    employees = db_session.scalars(select(Employee).order_by(Employee.employee_code)).all()
+    assert [employee.employee_code for employee in employees] == ["EMP-101", "EMP-102"]
+    assert [employee.whatsapp_number for employee in employees] == ["919876543210", "919123456789"]
+
+
+def test_employee_master_api_rejects_empty_file_without_writes(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Empty Import")
+    db_session.add(company)
+    db_session.commit()
+    response = client.post(
+        f"/api/v1/admin/companies/{company.id}/masters/employees/commit",
+        files={"file": ("employees.csv", b"employee_code,state,whatsapp_number\n", "text/csv")},
+        auth=("Admin", "Password"),
+    )
+    assert response.status_code == 200
+    assert response.json()["valid"] is False
+    assert response.json()["errors"] == [
+        {"row": 1, "field": "file", "message": "The employee master contains no data rows"}
+    ]
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+
+def test_employee_master_api_requires_pilot_administrator_credentials(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Protected Import")
+    db_session.add(company)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/v1/admin/companies/{company.id}/masters/employees/preview",
+        files={"file": ("employees.csv", b"employee_code\nEMP-101\n", "text/csv")},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"].startswith("Basic")
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+
+def test_employee_master_api_rejects_unknown_company_before_parsing_or_writing(
+    client: TestClient, db_session: Session
+) -> None:
+    response = client.post(
+        "/api/v1/admin/companies/not-a-company/masters/employees/preview",
+        files={"file": ("employees.csv", b"employee_code\nEMP-101\n", "text/csv")},
+        auth=("Admin", "Password"),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Company not found"
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+
+def test_employee_master_api_rejects_wrong_file_type_and_oversized_file_without_writes(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Upload Bounds")
+    db_session.add(company)
+    db_session.commit()
+    endpoint = f"/api/v1/admin/companies/{company.id}/masters/employees/preview"
+
+    wrong_type = client.post(
+        endpoint,
+        files={"file": ("employees.txt", b"not a master", "text/plain")},
+        auth=("Admin", "Password"),
+    )
+    oversized = client.post(
+        endpoint,
+        files={"file": ("employees.csv", b"x" * 10_000_001, "text/csv")},
+        auth=("Admin", "Password"),
+    )
+
+    assert wrong_type.status_code == 422
+    assert wrong_type.json()["detail"] == "Upload a CSV or XLSX file"
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"] == "Master file exceeds 10 MB"
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+
+def test_employee_master_commit_rolls_back_every_row_on_existing_phone_conflict(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Atomic Commit")
+    db_session.add(company)
+    db_session.flush()
+    db_session.add(
+        Employee(
+            company_id=company.id,
+            employee_code="EMP-EXISTING",
+            employment_type=EmploymentType.FULL_TIME,
+            state="Maharashtra",
+            whatsapp_number="919876543210",
+        )
+    )
+    db_session.commit()
+    content = (
+        "employee_code,employment_type,state,whatsapp_number\n"
+        "EMP-NEW,full_time,Maharashtra,9123456789\n"
+        "EMP-CONFLICT,contractual,Maharashtra,9876543210\n"
+    ).encode()
+
+    response = client.post(
+        f"/api/v1/admin/companies/{company.id}/masters/employees/commit",
+        files={"file": ("employees.csv", content, "text/csv")},
+        auth=("Admin", "Password"),
+    )
+
+    assert response.status_code == 409
+    assert "WhatsApp number already belongs to active employee EMP-EXISTING" in response.json()["detail"]
+    assert db_session.scalars(select(Employee).order_by(Employee.employee_code)).all()[0].employee_code == "EMP-EXISTING"
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 1
+
+
+def test_employee_master_allows_number_reassignment_after_employee_is_inactive(db_session: Session) -> None:
+    company, _, former = seed_company(db_session, name="Pilot Reassignment", phone_number_id="reassign-channel")
+    former.active = False
+    db_session.commit()
+    preview = preview_employees(
+        [
+            {
+                "employee_code": "EMP-NEW",
+                "employment_type": "full_time",
+                "state": "Maharashtra",
+                "whatsapp_number": former.whatsapp_number,
+            }
+        ]
+    )
+    assert preview.as_dict()["valid"] is True
+    assert commit_employees(db_session, company.id, preview) == 1
+    db_session.commit()
+    mappings = db_session.scalars(
+        select(Employee).where(Employee.company_id == company.id, Employee.whatsapp_number == former.whatsapp_number)
+    ).all()
+    assert len(mappings) == 2
+    assert sum(employee.active for employee in mappings) == 1
+
+
+def test_employee_master_api_returns_422_for_csv_rows_wider_than_header(
+    client: TestClient, db_session: Session
+) -> None:
+    company = Company(name="Pilot Malformed CSV")
+    db_session.add(company)
+    db_session.commit()
+    response = client.post(
+        f"/api/v1/admin/companies/{company.id}/masters/employees/preview",
+        files={
+            "file": (
+                "employees.csv",
+                b"employee_code,state,whatsapp_number\nEMP-1,Maharashtra,9876543210,unexpected\n",
+                "text/csv",
+            )
+        },
+        auth=("Admin", "Password"),
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "The uploaded file could not be parsed"
+    assert db_session.scalar(select(func.count()).select_from(Employee)) == 0
+
+
+def test_price_import_is_append_only_and_requires_known_competitor_product(db_session: Session) -> None:
+    company, _, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    product = Product(
+        company_id=company.id,
+        ownership=ProductOwnership.COMPETITOR,
+        brand="RivalShield",
+        category="fungicide",
+    )
+    db_session.add(product)
+    db_session.commit()
+    rows = [
+        {
+            "Brand": "RivalShield",
+            "State": "Maharashtra",
+            "Pack Size": "250 ml",
+            "Price Type": "Farmer Price",
+            "Amount": "540.00",
+            "Effective Date": "2026-08-01T00:00:00+00:00",
+        }
+    ]
+    preview = preview_prices(db_session, company.id, rows)
+    assert preview.as_dict()["valid"]
+    assert commit_prices(db_session, company.id, preview) == 1
+    assert commit_prices(db_session, company.id, preview) == 1
+    db_session.commit()
+    prices = db_session.scalars(select(CompetitionPrice).where(CompetitionPrice.product_id == product.id)).all()
+    assert len(prices) == 2
+    assert {price.price_type.value for price in prices} == {"farmer_price"}
+    assert all(price.source == "initial_upload" for price in prices)
+
+    missing_product = preview_prices(
+        db_session,
+        company.id,
+        [{**rows[0], "Brand": "Unknown competitor"}],
+    )
+    assert any(error.field == "brand" for error in missing_product.errors)
+
+
+def test_price_import_rejects_invalid_effective_date_instead_of_inventing_history(db_session: Session) -> None:
+    company, _, _ = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    db_session.add(
+        Product(
+            company_id=company.id,
+            ownership=ProductOwnership.COMPETITOR,
+            brand="RivalShield",
+            category="fungicide",
+        )
+    )
+    db_session.commit()
+    preview = preview_prices(
+        db_session,
+        company.id,
+        [
+            {
+                "Brand": "RivalShield",
+                "State": "Maharashtra",
+                "Pack Size": "250 ml",
+                "Price Type": "Farmer Price",
+                "Amount": "540.00",
+                "Effective Date": "not-a-date",
+            }
+        ],
+    )
+    assert any(error.field == "observed_at" for error in preview.errors)
+
+
+def test_model_router_uses_task_quality_thresholds_and_explicit_tiers() -> None:
+    router = ModelRouter()
+    assert router.route(TaskType.EXTRACTION, QualityTier.AUTO).model == "gpt-5.6-terra"
+    assert router.route(TaskType.REPORT_SYNTHESIS, QualityTier.AUTO).model == "gpt-5.6"
+    assert router.route(TaskType.REPORT_SYNTHESIS, QualityTier.ECONOMY).model == "gpt-5.6-terra"
+    assert router.route(TaskType.CONVERSATIONAL_ANALYSIS, QualityTier.PREMIUM).model == "gpt-5.6"
+    assert router.route(TaskType.TRANSCRIPTION, QualityTier.AUTO).model == "gpt-4o-mini-transcribe"
+    assert router.upgrade(router.route(TaskType.EXTRACTION), TaskType.EXTRACTION).model == "gpt-5.6"
+
+
+def test_signal_becomes_strong_only_with_independent_employee_evidence_and_appends_price(
+    db_session: Session,
+) -> None:
+    company, _, employee_one = seed_company(db_session, name="Pilot", phone_number_id="channel-one")
+    employee_two = Employee(
+        company_id=company.id,
+        employee_code="EMP-002",
+        employment_type=EmploymentType.CONTRACTUAL,
+        state="Maharashtra",
+        whatsapp_number="919876543211",
+    )
+    db_session.add(employee_two)
+    db_session.flush()
+    first_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_one.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    second_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_two.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    product = Product(
+        company_id=company.id,
+        ownership=ProductOwnership.COMPETITOR,
+        brand="RivalShield",
+        category="fungicide",
+    )
+    db_session.add_all([first_conversation, second_conversation, product])
+    db_session.flush()
+
+    def observation(employee_id: str, conversation_id: str, message_id: str) -> Observation:
+        return Observation(
+            company_id=company.id,
+            employee_id=employee_id,
+            conversation_id=conversation_id,
+            state="Maharashtra",
+            category="pricing_schemes",
+            subject_key="rivalshield:250ml:farmer_price",
+            claim="RivalShield farmer price is Rs 540 for 250 ml",
+            structured_data={
+                "price": {
+                    "product_id": product.id,
+                    "pack_size": "250 ml",
+                    "price_type": "farmer_price",
+                    "amount": "540.00",
+                    "currency": "INR",
+                }
+            },
+            confidence=Decimal("0.90"),
+            source_message_ids=[message_id],
+        )
+
+    first_observation = observation(employee_one.id, first_conversation.id, "message-1")
+    db_session.add(first_observation)
+    db_session.flush()
+    weak = upsert_signal(db_session, first_observation)
+    db_session.flush()
+    assert weak.strength == SignalStrength.WEAK
+    assert db_session.scalar(select(func.count()).select_from(CompetitionPrice)) == 0
+
+    second_observation = observation(employee_two.id, second_conversation.id, "message-2")
+    db_session.add(second_observation)
+    db_session.flush()
+    strong = upsert_signal(db_session, second_observation)
+    db_session.commit()
+
+    assert strong.strength == SignalStrength.STRONG
+    assert strong.distinct_employee_count == 2
+    price = db_session.scalar(select(CompetitionPrice).where(CompetitionPrice.source == "strong_field_signal"))
+    assert price is not None
+    assert price.amount == Decimal("540.00")
+    assert set(price.evidence_ids) == {first_observation.id, second_observation.id}

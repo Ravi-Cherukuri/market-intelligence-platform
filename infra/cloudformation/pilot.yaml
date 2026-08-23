@@ -1,0 +1,779 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Field intelligence pilot host - a cost-minimized single-instance deployment
+  with durable encrypted storage, HTTPS ingress, and keyless administration
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: public subnet -> EIP -> Caddy -> Docker Compose monolith; S3 durable media; SSM ops
+    must:
+      - single-host pilot only; no HA claim
+      - no inbound SSH; admin via SSM
+      - no secrets in template or user data
+      - deploy in ap-south-1 for India pilot data
+    ref:
+      - at: ../architecture.md
+        has: pilot scope, cost choices, recovery limits
+        scope: shared
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: pilot
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+    ConstraintDescription: Use 2-16 lowercase letters, digits, or hyphens.
+  DomainName:
+    Type: String
+    Default: fieldintel.svabhu.com
+    AllowedPattern: '^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  RootVolumeSize:
+    Type: Number
+    Default: 12
+    MinValue: 10
+    MaxValue: 50
+  DataVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 500
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Enter the email address that should receive pilot alarms.
+
+Resources:
+  PilotVpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolated low-cost network; public subnet avoids NAT hourly cost for one host
+        must:
+          - DNS support stays enabled for AWS endpoints and outbound providers
+        mutable: change-with-constraints
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref PilotVpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: one public subnet for direct EIP ingress; transient boot IP enables package install before EIP association
+        must:
+          - only 80/443 allowed while transient boot IP exists
+          - retained EIP becomes sole DNS target
+        mutable: change-with-constraints
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref PilotVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-a'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PilotVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-routes'
+
+  DefaultInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: public Meta webhook and admin HTTPS; port 80 only redirects and completes ACME
+        must:
+          - never add SSH ingress
+          - only 80/443 may be internet-facing
+        mutable: review-required
+    Properties:
+      GroupDescription: Public HTTP and HTTPS for the field intelligence pilot
+      VpcId: !Ref PilotVpc
+      SecurityGroupIngress:
+        - Description: ACME challenge and HTTPS redirect
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: Admin application and Meta webhook
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: HTTPS for AWS, Meta, OpenAI, packages, and certificate issuance
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: DNS over UDP
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+        - Description: DNS over TCP
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+        - Description: Time synchronization
+          IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web'
+
+  StorageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: durable tenant-scoped media, database dumps, and release artifacts outside host lifecycle
+        must:
+          - public access remains blocked
+          - encryption and versioning remain enabled
+          - deletion requires explicit data-retention review
+        mutable: review-required
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireOldReleaseVersions
+            Status: Enabled
+            Prefix: releases/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: DataClass
+          Value: field-intelligence
+
+  StorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: enforce TLS for every principal and operation
+        must:
+          - aws:SecureTransport deny stays in place
+    Properties:
+      Bucket: !Ref StorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt StorageBucket.Arn
+              - !Sub '${StorageBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  ApplicationRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: private versioned ARM64 application images; GitHub/CI not required for pilot deploys
+        must:
+          - push linux/arm64 images for Graviton host
+          - immutable tags prevent release replacement
+        mutable: review-required
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Expire untagged images after 7 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}},{"rulePriority":2,"description":"Keep twenty tagged releases","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InstanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: bounded bootstrap and host logs for pilot diagnosis
+        must:
+          - never log message bodies, credentials, or media URLs
+        mutable: free-to-tune
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AlarmKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: encrypt alarm notifications while allowing CloudWatch to publish
+        must:
+          - key policy retains account administration and CloudWatch publish access
+        mutable: review-required
+    Properties:
+      Description: Encryption key for field intelligence pilot alarm notifications
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: CloudWatchAlarmPublishing
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: single alarm fan-out for host health and capacity warnings
+        must:
+          - alert subscription must be confirmed before testing alarms
+    Properties:
+      KmsMasterKeyId: !Ref AlarmKey
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: short-lived instance credentials for SSM, telemetry, S3, and ECR; no embedded keys
+        must:
+          - no application-provider secrets in user data
+          - scope S3 and ECR access to this stack
+        mutable: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: PilotRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StorageList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt StorageBucket.Arn
+              - Sid: StorageObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${StorageBucket.Arn}/*'
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ApplicationRepository.Arn
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: FieldIntel/Pilot
+              - Sid: HostLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource: !GetAtt InstanceLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: reproducible hardened Graviton host; standard CPU credits cap burst-charge risk
+        must:
+          - AMI architecture must be arm64
+          - IMDSv2 required with hop limit 2 for containers
+          - root storage stays encrypted
+          - bootstrap contains no secrets
+        mutable: change-with-constraints
+    Properties:
+      VersionDescription: Initial pilot host
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+        CreditSpecification:
+          CpuCredits: standard
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+          HttpTokens: required
+          InstanceMetadataTags: disabled
+        Monitoring:
+          Enabled: false
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-host'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-root'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            dnf install -y docker amazon-cloudwatch-agent jq
+            systemctl enable --now amazon-ssm-agent
+
+            install -d -m 0750 -o ec2-user -g ec2-user /opt/fieldintel
+            install -d -m 0750 /var/log/fieldintel
+            usermod -aG docker ec2-user
+
+            systemctl stop docker || true
+            install -d -m 0710 /var/lib/docker
+
+            DATA_DEVICE=''
+            for attempt in $(seq 1 60); do
+              if [ -b /dev/xvdf ]; then
+                DATA_DEVICE=/dev/xvdf
+                break
+              fi
+              for candidate in /dev/nvme*n1; do
+                [ -b "$candidate" ] || continue
+                if /sbin/ebsnvme-id -u "$candidate" 2>/dev/null | grep -qx '/dev/sdf'; then
+                  DATA_DEVICE="$candidate"
+                  break 2
+                fi
+              done
+              sleep 5
+            done
+            if [ -z "$DATA_DEVICE" ]; then
+              echo 'Retained data volume did not attach as /dev/sdf' >&2
+              exit 1
+            fi
+            if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+              mkfs.xfs "$DATA_DEVICE"
+            fi
+            DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+            if ! grep -q "$DATA_UUID" /etc/fstab; then
+              echo "UUID=$DATA_UUID /var/lib/docker xfs defaults,nofail 0 2" >> /etc/fstab
+            fi
+            mount /var/lib/docker
+
+            cat >/etc/docker/daemon.json <<'JSON'
+            {
+              "log-driver": "json-file",
+              "log-opts": {"max-size": "10m", "max-file": "3"}
+            }
+            JSON
+            systemctl enable --now docker
+
+            if [ ! -f /swapfile ]; then
+              fallocate -l 2G /swapfile
+              chmod 0600 /swapfile
+              mkswap /swapfile
+              swapon /swapfile
+              echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+
+            cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+            {
+              "agent": {"metrics_collection_interval": 60, "run_as_user": "root"},
+              "logs": {"logs_collected": {"files": {"collect_list": [
+                {"file_path": "/var/log/cloud-init-output.log", "log_group_name": "${InstanceLogGroup}", "log_stream_name": "{instance_id}/cloud-init"}
+              ]}}},
+              "metrics": {
+                "namespace": "FieldIntel/Pilot",
+                "append_dimensions": {"InstanceId": "${!aws:InstanceId}"},
+                "aggregation_dimensions": [["InstanceId"]],
+                "metrics_collected": {
+                  "disk": {"measurement": ["used_percent"], "metrics_collection_interval": 60, "resources": ["/", "/var/lib/docker"]},
+                  "mem": {"measurement": ["mem_used_percent"], "metrics_collection_interval": 60}
+                }
+              }
+            }
+            JSON
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+            echo 'FieldIntel host bootstrap complete' >/opt/fieldintel/BOOTSTRAP_COMPLETE
+
+  PilotInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultInternetRoute
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: single low-traffic pilot host; resize to t4g.medium before sustained media or local scanning
+        must:
+          - no HA promise; restore from S3 + EBS snapshots on host loss
+          - AI and transcription run via external APIs, not locally
+        mutable: review-required
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: retain Docker and PostgreSQL state independently from replaceable host OS
+        must:
+          - never format when a filesystem already exists
+          - snapshot daily and retain on stack deletion
+          - remain in same AZ as pilot subnet
+        mutable: must-never-change
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnet.AvailabilityZone
+      Encrypted: true
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data'
+        - Key: fieldintel:backup
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: fixed device mapping lets bootstrap mount retained state before Docker starts
+        must:
+          - requested device remains /dev/sdf; bootstrap maps Nitro NVMe name back to it
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref PilotInstance
+      VolumeId: !Ref DataVolume
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: stable GoDaddy A-record target for Meta webhook callback
+        must:
+          - release manually if pilot is retired; idle addresses remain billable
+        mutable: must-never-change
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-ip'
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref PilotInstance
+
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  DailySnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: whole-host recovery complement to application-level database dumps
+        must:
+          - retain seven daily snapshots
+          - snapshots are crash-consistent; pg_dump remains required
+        mutable: change-with-constraints
+    Properties:
+      Description: Daily snapshots for the field intelligence pilot
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes:
+          - VOLUME
+        TargetTags:
+          - Key: fieldintel:backup
+            Value: 'true'
+        Schedules:
+          - Name: Daily at midnight India time
+            CopyTags: true
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times:
+                - '18:30'
+            RetainRule:
+              Count: 7
+      State: ENABLED
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: EC2 system or instance status check failed
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref PilotInstance
+      EvaluationPeriods: 2
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      TreatMissingData: breaching
+
+  CpuHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPU has remained above 80 percent for 15 minutes
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref PilotInstance
+      EvaluationPeriods: 3
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Period: 300
+      Statistic: Average
+      Threshold: 80
+      TreatMissingData: notBreaching
+
+  CpuCreditLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Burstable CPU credit balance is low
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref PilotInstance
+      EvaluationPeriods: 2
+      MetricName: CPUCreditBalance
+      Namespace: AWS/EC2
+      Period: 300
+      Statistic: Minimum
+      Threshold: 20
+      TreatMissingData: notBreaching
+
+  MemoryHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Host memory usage has remained above 85 percent
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref PilotInstance
+      EvaluationPeriods: 3
+      MetricName: mem_used_percent
+      Namespace: FieldIntel/Pilot
+      Period: 300
+      Statistic: Average
+      Threshold: 85
+      TreatMissingData: breaching
+
+  DiskHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Root filesystem usage has remained above 80 percent
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref PilotInstance
+      EvaluationPeriods: 2
+      MetricName: disk_used_percent
+      Namespace: FieldIntel/Pilot
+      Period: 300
+      Statistic: Maximum
+      Threshold: 80
+      TreatMissingData: breaching
+
+Outputs:
+  ApplicationUrl:
+    Description: HTTPS address after the DNS record is created and the app is deployed
+    Value: !Sub 'https://${DomainName}'
+  WebhookUrl:
+    Description: Meta WhatsApp webhook callback URL
+    Value: !Sub 'https://${DomainName}/api/v1/webhooks/whatsapp'
+  ElasticIpAddress:
+    Description: Add this value as the GoDaddy A record for the selected hostname
+    Value: !Ref ElasticIp
+  DnsRecordName:
+    Description: GoDaddy host/name value
+    Value: fieldintel
+  InstanceId:
+    Description: Target for AWS Systems Manager sessions and deployment commands
+    Value: !Ref PilotInstance
+  StorageBucketName:
+    Description: Private bucket for media, database dumps, and release bundles
+    Value: !Ref StorageBucket
+  ApplicationRepositoryUri:
+    Description: Private ECR repository for ARM64 application images
+    Value: !GetAtt ApplicationRepository.RepositoryUri
+  AlarmTopicArn:
+    Description: SNS topic used by operational alarms
+    Value: !Ref AlarmTopic

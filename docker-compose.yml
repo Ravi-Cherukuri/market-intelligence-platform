@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - work_mem=4MB
+    environment:
+      POSTGRES_DB: market_intel
+      POSTGRES_USER: market_intel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market_intel -d market_intel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 448m
+
+  api:
+    build:
+      context: ./backend
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql+psycopg://market_intel:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/market_intel
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    mem_limit: 320m
+
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.worker"]
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql+psycopg://market_intel:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/market_intel
+      SKIP_MIGRATIONS: "1"
+      ENVIRONMENT: production
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 320m
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    environment:
+      NEXT_PUBLIC_API_URL: /api/v1
+      API_INTERNAL_URL: http://api:8000
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-Admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+    depends_on:
+      - api
+    restart: unless-stopped
+    mem_limit: 384m
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+    restart: unless-stopped
+    mem_limit: 128m
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

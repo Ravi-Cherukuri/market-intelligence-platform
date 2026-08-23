@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Field intelligence pilot cost guardrail - a monthly budget with escalating
+  actual and forecast email notifications
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: account-level cost alert deployed in us-east-1; no resource shutdown action
+    must:
+      - budget alerts do not cap or stop spend
+      - deploy in us-east-1
+    ref:
+      - at: ../architecture.md
+        has: pilot scope, cost choices, recovery limits
+        scope: shared
+
+Parameters:
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 25
+    MinValue: 5
+    MaxValue: 500
+
+Resources:
+  PilotBudget:
+    Type: AWS::Budgets::Budget
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: early warning for cost drift; thresholds chosen for a sub-$25 pilot baseline
+        must:
+          - notifications remain actual 50/80/100 + forecast 100
+          - no automated resource deletion or shutdown
+        mutable: change-with-constraints
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  BudgetName:
+    Description: Account-level monthly pilot budget name
+    Value: !Ref PilotBudget

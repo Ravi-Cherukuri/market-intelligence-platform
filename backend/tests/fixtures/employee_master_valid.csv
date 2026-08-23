@@ -1,0 +1,3 @@
+employee_code,employment_type,designation,territory_code,state,email,whatsapp_number,active
+EMP-DEMO-001,full_time,Field Officer,FOT-MH-01,Maharashtra,,9876500001,true
+EMP-DEMO-002,contractual,Field Associate,FOT-GJ-01,Gujarat,demo@example.com,9876500002,true
