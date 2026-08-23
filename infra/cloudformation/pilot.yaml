@@ -541,7 +541,7 @@ Resources:
             # Amazon Linux 2023 ships curl-minimal, which provides the curl CLI.
             # Installing the full curl package alongside it causes a DNF conflict
             # on current AMIs and aborts the CloudFormation bootstrap.
-            dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft
+            dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft xfsprogs
             install -d -m 0755 /usr/local/libexec/docker/cli-plugins
             curl --fail --location --silent --show-error \
               --retry 5 --retry-all-errors --retry-max-time 300 \
@@ -666,7 +666,7 @@ Resources:
               fi
               for candidate in /dev/nvme*n1; do
                 [ -b "$candidate" ] || continue
-                if /sbin/ebsnvme-id -u "$candidate" 2>/dev/null | grep -qx '/dev/sdf'; then
+                if /sbin/ebsnvme-id -b "$candidate" 2>/dev/null | grep -qx '/dev/sdf'; then
                   DATA_DEVICE="$candidate"
                   break 2
                 fi
@@ -677,10 +677,31 @@ Resources:
               echo 'Retained data volume did not attach as /dev/sdf' >&2
               exit 1
             fi
-            if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+            SIGNATURE_TYPES=''
+            if ! SIGNATURE_TYPES=$(wipefs --noheadings --output TYPE "$DATA_DEVICE" 2>/dev/null); then
+              echo 'Unable to inspect the retained data volume safely' >&2
+              exit 1
+            fi
+            if [ -z "$(printf '%s' "$SIGNATURE_TYPES" | tr -d '[:space:]')" ]; then
               mkfs.xfs "$DATA_DEVICE"
             fi
-            DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+            FILESYSTEM_TYPE=''
+            if ! FILESYSTEM_TYPE=$(blkid -s TYPE -o value "$DATA_DEVICE"); then
+              echo 'Unable to identify the retained data volume filesystem' >&2
+              exit 1
+            fi
+            if [ "$FILESYSTEM_TYPE" != 'xfs' ]; then
+              echo "Refusing to mount unexpected data volume filesystem: $FILESYSTEM_TYPE" >&2
+              exit 1
+            fi
+            if ! DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE"); then
+              echo 'Unable to read the retained data volume UUID' >&2
+              exit 1
+            fi
+            if [ -z "$DATA_UUID" ]; then
+              echo 'Retained data volume UUID is empty' >&2
+              exit 1
+            fi
             if ! grep -q "$DATA_UUID" /etc/fstab; then
               echo "UUID=$DATA_UUID /var/lib/docker xfs defaults 0 2" >> /etc/fstab
             fi

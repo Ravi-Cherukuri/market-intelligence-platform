@@ -25,10 +25,17 @@ test("pilot infrastructure keeps the approved low-cost security boundaries", asy
   assert.match(template, /CreationPolicy:[\s\S]*?ResourceSignal:/);
   assert.match(template, /DataVolumeMountAssociation:/);
   assert.match(template, /WaitForSuccessTimeoutSeconds: 900/);
-  assert.match(template, /dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft/);
+  assert.match(template, /dnf install -y docker amazon-cloudwatch-agent aws-cfn-bootstrap jq iptables-nft xfsprogs/);
   assert.doesNotMatch(template, /dnf install[^\n]*\bcurl\b/);
   assert.match(template, /--retry 5 --retry-all-errors --retry-max-time 300/);
   assert.match(template, /--connect-timeout 10 --max-time 120/);
+  assert.match(template, /ebsnvme-id -b "\$candidate"/);
+  assert.doesNotMatch(template, /ebsnvme-id -u "\$candidate"/);
+  assert.match(template, /wipefs --noheadings --output TYPE "\$DATA_DEVICE"/);
+  assert.match(template, /printf '%s' "\$SIGNATURE_TYPES" \| tr -d '\[:space:\]'/);
+  assert.doesNotMatch(template, /\$\{SIGNATURE_TYPES/);
+  assert.match(template, /Refusing to mount unexpected data volume filesystem/);
+  assert.doesNotMatch(template, /if ! blkid "\$DATA_DEVICE"[\s\S]*?mkfs\.xfs/);
   assert.doesNotMatch(template, /FromPort: 22|ToPort: 22/);
   assert.doesNotMatch(template, /WHATSAPP_ACCESS_TOKEN|OPENAI_API_KEY|ADMIN_PASSWORD/);
 });
