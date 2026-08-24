@@ -53,6 +53,15 @@ docker buildx build --platform linux/arm64 \
   --file backend/Dockerfile \
   --tag "$REPOSITORY_URI:api-$RELEASE_ID" \
   --push backend
+API_RUNTIME_UID=$(docker run --rm --platform linux/arm64 \
+  --entrypoint id "$REPOSITORY_URI:api-$RELEASE_ID" -u)
+[[ "$API_RUNTIME_UID" == "10001" ]] || {
+  echo "API image must run as UID 10001, got: $API_RUNTIME_UID" >&2
+  exit 1
+}
+docker run --rm --platform linux/arm64 \
+  --entrypoint python "$REPOSITORY_URI:api-$RELEASE_ID" -c \
+  'import app.main, app.worker, boto3, fastapi, greenlet, httptools, jiter, markupsafe, openai, openpyxl, psycopg, pydantic_core, sqlalchemy, uvicorn, uvloop, watchfiles, websockets, yaml; assert psycopg.pq.__impl__ == "binary", psycopg.pq.__impl__'
 docker buildx build --platform linux/arm64 \
   --file Dockerfile.web \
   --tag "$REPOSITORY_URI:web-$RELEASE_ID" \

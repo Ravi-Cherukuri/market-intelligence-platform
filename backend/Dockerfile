@@ -1,11 +1,11 @@
-FROM python:3.12-slim
+FROM python:3.12.14-alpine3.24@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-RUN addgroup --system --gid 10001 app && adduser --system --uid 10001 --ingroup app app
+RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app

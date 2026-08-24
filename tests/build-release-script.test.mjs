@@ -18,6 +18,7 @@ test("archived source builds retain managed provenance without Git metadata", as
   await writeFile(join(scriptDirectory, "build-release.sh"), buildScript);
   await chmod(join(scriptDirectory, "build-release.sh"), 0o755);
   await writeFile(join(scriptDirectory, "check-migrations.py"), "# command is stubbed\n");
+  const dockerCallLog = join(directory, "docker-calls.log");
 
   const digest = `sha256:${"a".repeat(64)}`;
   const awsStub = `#!/bin/bash
@@ -32,7 +33,15 @@ esac
   await writeFile(join(binaryDirectory, "aws"), awsStub);
   await writeFile(
     join(binaryDirectory, "docker"),
-    "#!/bin/bash\nset -euo pipefail\nif [[ ${1:-} == login ]]; then /bin/cat >/dev/null; fi\n",
+    `#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >>"$DOCKER_CALL_LOG"
+if [[ \${1:-} == login ]]; then
+  /bin/cat >/dev/null
+elif [[ \${1:-} == run && "$*" == *"--entrypoint id"* ]]; then
+  printf '%s\\n' 10001
+fi
+`,
   );
   await writeFile(join(binaryDirectory, "python3"), "#!/bin/bash\nexit 0\n");
   await chmod(join(binaryDirectory, "aws"), 0o755);
@@ -53,6 +62,7 @@ esac
         ...process.env,
         PATH: `${binaryDirectory}:/usr/bin:/bin`,
         BUILD_ARN: `arn:aws:codebuild:ap-south-1:123456789012:build/fieldintel-pilot-application:${buildUuid}`,
+        DOCKER_CALL_LOG: dockerCallLog,
         SOURCE_ARCHIVE_SHA256: sourceChecksum,
         SOURCE_COMMIT: sourceCommit,
         SOURCE_VERSION: "source-version-123",
@@ -70,4 +80,18 @@ esac
   for (const key of ["api_image", "web_image", "postgres_image", "caddy_image"]) {
     assert.match(manifest[key], /@sha256:[a-f0-9]{64}$/);
   }
+  const dockerCalls = await readFile(dockerCallLog, "utf8");
+  assert.match(
+    dockerCalls,
+    new RegExp(`run --rm --platform linux/arm64 --entrypoint id .*:api-${releaseId} -u`),
+  );
+  assert.match(
+    dockerCalls,
+    new RegExp(
+      `run --rm --platform linux/arm64 --entrypoint python .*:api-${releaseId} -c ` +
+        `import app\\.main, app\\.worker, boto3, fastapi, greenlet, httptools, jiter, markupsafe, openai, openpyxl, ` +
+        `psycopg, pydantic_core, sqlalchemy, uvicorn, uvloop, watchfiles, websockets, yaml; ` +
+        `assert psycopg\\.pq\\.__impl__ == "binary", psycopg\\.pq\\.__impl__`,
+    ),
+  );
 });

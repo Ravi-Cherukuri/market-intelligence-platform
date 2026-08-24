@@ -141,11 +141,45 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
   const build = await source("infra/scripts/build-release.sh");
   const activate = await source("infra/scripts/activate-release.sh");
   const releaseEnv = await source("infra/scripts/release-env.sh");
+  const apiDockerfile = await source("backend/Dockerfile");
   const webDockerfile = await source("Dockerfile.web");
 
   assert.match(compose, /API_IMAGE:\?Set API_IMAGE to an immutable ECR digest/);
   assert.match(compose, /WEB_IMAGE:\?Set WEB_IMAGE to an immutable ECR digest/);
   assert.match(build, /--platform linux\/arm64/);
+  assert.match(
+    apiDockerfile,
+    /^FROM python:3\.12\.14-alpine3\.24@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31$/m,
+  );
+  assert.match(apiDockerfile, /addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app/);
+  assert.doesNotMatch(apiDockerfile, /python:3\.12-slim|addgroup --system|adduser --system/);
+  assert.match(build, /API_RUNTIME_UID=\$\(docker run --rm --platform linux\/arm64/);
+  assert.match(build, /--entrypoint id "\$REPOSITORY_URI:api-\$RELEASE_ID" -u/);
+  assert.match(build, /\[\[ "\$API_RUNTIME_UID" == "10001" \]\]/);
+  assert.match(build, /--entrypoint python "\$REPOSITORY_URI:api-\$RELEASE_ID" -c/);
+  for (const moduleName of [
+    "app.main",
+    "app.worker",
+    "boto3",
+    "fastapi",
+    "greenlet",
+    "httptools",
+    "jiter",
+    "markupsafe",
+    "openai",
+    "openpyxl",
+    "psycopg",
+    "pydantic_core",
+    "sqlalchemy",
+    "uvicorn",
+    "uvloop",
+    "watchfiles",
+    "websockets",
+    "yaml",
+  ]) {
+    assert.ok(build.includes(moduleName), `API smoke must import ${moduleName}`);
+  }
+  assert.match(build, /assert psycopg\.pq\.__impl__ == "binary", psycopg\.pq\.__impl__/);
   assert.match(build, /describe-image-scan-findings/);
   assert.match(build, /CRITICAL/);
   assert.match(releaseEnv, /@sha256:/);
