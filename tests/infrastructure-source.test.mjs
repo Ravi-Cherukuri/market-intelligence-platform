@@ -66,6 +66,10 @@ test("managed release builds are bounded, native ARM64, and least privilege", as
   const buildspec = await source("infra/codebuild/buildspec.yml");
   const starter = await source("infra/scripts/start-managed-build.sh");
   const build = await source("infra/scripts/build-release.sh");
+  const packageManifest = JSON.parse(await source("package.json"));
+  const dependencyPolicy = await source("pnpm-workspace.yaml");
+  const lockfile = await source("pnpm-lock.yaml");
+  const webDockerfile = await source("Dockerfile.web");
 
   assert.match(template, /ApplicationBuildProject:\n\s+Type: AWS::CodeBuild::Project/);
   assert.doesNotMatch(template, /AWS::EC2::Instance|AWS::S3::Bucket|AWS::ECR::Repository/);
@@ -89,6 +93,7 @@ test("managed release builds are bounded, native ARM64, and least privilege", as
   assert.doesNotMatch(template, /Name: (WHATSAPP_ACCESS_TOKEN|OPENAI_API_KEY|ADMIN_PASSWORD)/);
   assert.match(buildspec, /docker info/);
   assert.match(buildspec, /docker buildx version/);
+  assert.match(buildspec, /pnpm install --frozen-lockfile/);
   assert.match(buildspec, /test "\$\(uname -m\)" = "aarch64"/);
   assert.match(buildspec, /SOURCE_COMMIT:0:12.*CODEBUILD_BUILD_ID/);
   assert.match(buildspec, /CODEBUILD_SOURCE_VERSION/);
@@ -113,6 +118,22 @@ test("managed release builds are bounded, native ARM64, and least privilege", as
   assert.match(starter, /seq 1 390/);
   assert.match(starter, /FAILED\|FAULT\|STOPPED\|TIMED_OUT/);
   assert.match(build, /SOURCE_COMMIT must identify the archived Git commit/);
+  assert.equal(packageManifest.packageManager, "pnpm@11.19.0");
+  assert.match(lockfile, /^  sharp@0\.34\.5:/m);
+  assert.match(lockfile, /^  unrs-resolver@1\.12\.2:/m);
+  assert.equal(
+    dependencyPolicy.trim(),
+    'allowBuilds:\n  "sharp@0.34.5": false\n  "unrs-resolver@1.12.2": false',
+    "dependency lifecycle scripts must remain denied at their reviewed versions",
+  );
+  assert.doesNotMatch(
+    dependencyPolicy,
+    /dangerouslyAllowAllBuilds|strictDepBuilds|onlyBuiltDependencies|ignoredBuiltDependencies|:\s*true\b|[*^~]/,
+  );
+  assert.match(
+    webDockerfile,
+    /COPY package\.json pnpm-lock\.yaml pnpm-workspace\.yaml \.\/\nRUN pnpm install --frozen-lockfile/,
+  );
 });
 
 test("production releases use ARM64 ECR digests with health-checked rollback", async () => {
