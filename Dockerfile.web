@@ -16,6 +16,10 @@ FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
+# Next standalone otherwise binds to Docker's generated hostname. Binding all
+# container interfaces keeps both the reverse proxy and localhost health probes
+# deterministic without publishing port 3000 on the host.
+ENV HOSTNAME=0.0.0.0
 RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static

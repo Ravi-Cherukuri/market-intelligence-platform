@@ -140,6 +140,9 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
   const compose = await source("docker-compose.production.yml");
   const build = await source("infra/scripts/build-release.sh");
   const activate = await source("infra/scripts/activate-release.sh");
+  const activationHealth = await source("infra/scripts/activation-health.sh");
+  const deploy = await source("infra/scripts/deploy-release.sh");
+  const packageRelease = await source("infra/scripts/package-release.sh");
   const releaseEnv = await source("infra/scripts/release-env.sh");
   const apiDockerfile = await source("backend/Dockerfile");
   const webDockerfile = await source("Dockerfile.web");
@@ -188,7 +191,20 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
   assert.match(activate, /RUN_MIGRATIONS=1/);
   assert.match(activate, /health_check \"\$PREVIOUS_DIR\"/);
   assert.match(webDockerfile, /API_INTERNAL_URL=http:\/\/api:8000/);
-  assert.match(activate, /\/api\/v1\/admin\/setup/);
+  assert.match(webDockerfile, /ENV HOSTNAME=0\.0\.0\.0/);
+  assert.match(activate, /source "\$RELEASE_DIR\/scripts\/activation-health\.sh"/);
+  assert.match(activate, /capture_activation_diagnostics "\$RELEASE_DIR"/);
+  assert.match(activationHealth, /\/api\/v1\/admin\/setup/);
+  assert.match(activationHealth, /HEALTH_CHECK_TIMEOUT_SECONDS:-180/);
+  assert.match(activationHealth, /failed_component=web/);
+  assert.match(activationHealth, /failed_component=worker/);
+  assert.match(activationHealth, /logs --tail 100 api web worker caddy/);
+  assert.doesNotMatch(deploy, /aws ssm wait command-executed/);
+  assert.match(deploy, /DEPLOY_POLL_MAX_ATTEMPTS:-180/);
+  assert.match(deploy, /Failed\|Cancelled\|TimedOut\|Cancelling/);
+  assert.match(packageRelease, /infra\/scripts\/activation-health\.sh/);
+  assert.match(compose, /web:[\s\S]*?healthcheck:[\s\S]*?localhost:3000\/api\/v1\/admin\/setup/);
+  assert.match(compose, /web:\n\s+condition: service_healthy/);
 });
 
 test("logical backups are validated, size-checked, retained, and monitored", async () => {

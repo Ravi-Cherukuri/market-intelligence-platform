@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+wait_for_ssm_command() {
+  local command_id=$1 instance_id=$2 aws_region=$3
+  local interval=${DEPLOY_POLL_INTERVAL_SECONDS:-5}
+  local max_attempts=${DEPLOY_POLL_MAX_ATTEMPTS:-180}
+  local attempt status=Pending response_code=-1 invocation
+  [[ "$interval" =~ ^[0-9]+$ && "$max_attempts" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Deployment polling configuration must be non-negative integers" >&2
+    return 2
+  }
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    # A newly-created invocation can briefly be absent from SSM's read path.
+    # Treat that eventual-consistency window as Pending, but fail on known
+    # terminal command states.
+    if invocation=$(aws ssm get-command-invocation \
+      --command-id "$command_id" --instance-id "$instance_id" \
+      --region "$aws_region" --query '[Status,ResponseCode]' --output text 2>/dev/null); then
+      read -r status response_code <<<"$invocation"
+    else
+      status=Pending
+      response_code=-1
+    fi
+    case "$status" in
+      Success)
+        printf '{"Status":"%s","ResponseCode":%s}\n' "$status" "$response_code"
+        return 0
+        ;;
+      Failed|Cancelled|TimedOut|Cancelling)
+        printf '{"Status":"%s","ResponseCode":%s}\n' "$status" "$response_code" >&2
+        return 1
+        ;;
+      Pending|InProgress|Delayed) ;;
+      *) echo "Unexpected SSM command status: $status" >&2; return 1 ;;
+    esac
+    (( attempt == max_attempts )) && break
+    sleep "$interval"
+  done
+  printf '{"Status":"%s","ResponseCode":%s,"TimedOutAfterSeconds":%s}\n' \
+    "$status" "$response_code" "$((max_attempts * interval))" >&2
+  return 1
+}
+
+if [[ ${FIELDINTEL_DEPLOY_LIBRARY_ONLY:-0} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 if [[ $# -ne 4 ]]; then
   echo "Usage: $0 <instance-id> <release-id> <storage-bucket> <aws-region>" >&2
   exit 2
@@ -39,6 +84,4 @@ COMMAND_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
   --query Command.CommandId \
   --output text)
-aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
-aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-  --region "$AWS_REGION" --query '{Status:Status,ResponseCode:ResponseCode}' --output json
+wait_for_ssm_command "$COMMAND_ID" "$INSTANCE_ID" "$AWS_REGION"

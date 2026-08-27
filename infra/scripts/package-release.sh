@@ -30,7 +30,8 @@ trap cleanup EXIT
 install -d "$PACKAGE_DIR/release/scripts" "$PACKAGE_DIR/release/systemd"
 install -m 0644 "$MANIFEST" "$PACKAGE_DIR/release/release.json"
 install -m 0644 docker-compose.production.yml Caddyfile "$PACKAGE_DIR/release/"
-install -m 0755 infra/scripts/activate-release.sh infra/scripts/backup-postgres.sh \
+install -m 0755 infra/scripts/activate-release.sh infra/scripts/activation-health.sh \
+  infra/scripts/backup-postgres.sh \
   infra/scripts/report-backup-age.sh infra/scripts/release-env.sh \
   infra/scripts/restore-postgres.sh infra/scripts/quiesce-host.sh \
   infra/scripts/configure-container-firewall.sh "$PACKAGE_DIR/release/scripts/"

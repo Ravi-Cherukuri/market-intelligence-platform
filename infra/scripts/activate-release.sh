@@ -29,6 +29,7 @@ fi
 
 export RUNTIME_ENV_FILE
 source "$RELEASE_DIR/scripts/release-env.sh" "$MANIFEST"
+source "$RELEASE_DIR/scripts/activation-health.sh"
 "$RELEASE_DIR/scripts/configure-container-firewall.sh"
 
 REGISTRY=${API_IMAGE%%/*}
@@ -59,20 +60,6 @@ compose_up() {
     -f "$directory/docker-compose.production.yml" pull
   docker compose --project-name fieldintel --env-file "$RUNTIME_ENV_FILE" \
     -f "$directory/docker-compose.production.yml" up -d --remove-orphans
-}
-
-health_check() {
-  local directory=$1
-  local compose_file="$directory/docker-compose.production.yml"
-  source "$directory/scripts/release-env.sh" "$directory/release.json"
-  docker compose --project-name fieldintel --env-file "$RUNTIME_ENV_FILE" \
-    -f "$compose_file" exec -T api python -c \
-    "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=5)" &&
-  docker compose --project-name fieldintel --env-file "$RUNTIME_ENV_FILE" \
-    -f "$compose_file" exec -T web node -e \
-    "const a=Buffer.from(process.env.ADMIN_USERNAME+':'+process.env.ADMIN_PASSWORD).toString('base64'); fetch('http://localhost:3000/api/v1/admin/setup',{headers:{authorization:'Basic '+a},signal:AbortSignal.timeout(10000)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))" &&
-  docker compose --project-name fieldintel --env-file "$RUNTIME_ENV_FILE" \
-    -f "$compose_file" exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 
 rollback_release() {
@@ -109,7 +96,12 @@ if ! docker compose --project-name fieldintel --env-file "$RUNTIME_ENV_FILE" \
   rollback_release
   exit 1
 fi
-if ! compose_up "$RELEASE_DIR" || ! health_check "$RELEASE_DIR"; then
+if ! compose_up "$RELEASE_DIR"; then
+  capture_activation_diagnostics "$RELEASE_DIR"
+  rollback_release
+  exit 1
+fi
+if ! health_check "$RELEASE_DIR"; then
   rollback_release
   exit 1
 fi

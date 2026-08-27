@@ -98,6 +98,19 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const a=Buffer.from(process.env.ADMIN_USERNAME+':'+process.env.ADMIN_PASSWORD).toString('base64');
+          fetch('http://localhost:3000/api/v1/admin/setup',{headers:{authorization:'Basic '+a},signal:AbortSignal.timeout(10000)})
+          .then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 12s
+      retries: 24
+      start_period: 5s
     restart: unless-stopped
     cap_drop: [NET_RAW]
     mem_limit: 384m
@@ -120,7 +133,7 @@ services:
       api:
         condition: service_healthy
       web:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     cap_drop: [NET_RAW]
     mem_limit: 128m
