@@ -66,24 +66,43 @@ def read_tabular_upload(filename: str, content: bytes) -> list[dict[str, str]]:
                 if sum(item.file_size for item in archive.infolist()) > MAX_XLSX_UNCOMPRESSED_BYTES:
                     raise ValueError("XLSX content exceeds the 50 MB decompressed limit")
             workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-            sheet = workbook.active
-            if sheet.max_column > MAX_IMPORT_COLUMNS or sheet.max_row > MAX_IMPORT_ROWS + 1:
-                raise ValueError(
-                    f"Master files may contain at most {MAX_IMPORT_ROWS} rows and {MAX_IMPORT_COLUMNS} columns"
-                )
-            iterator = sheet.iter_rows(values_only=True)
-            first_row = next(iterator, None)
-            if first_row is None:
-                return []
-            headers = _headers(list(first_row))
-            rows: list[dict[str, str]] = []
-            for row in iterator:
-                if not any(value not in (None, "") for value in row):
-                    continue
-                if len(rows) >= MAX_IMPORT_ROWS:
-                    raise ValueError(f"Master files may contain at most {MAX_IMPORT_ROWS} data rows")
-                rows.append({headers[index]: str(value or "").strip() for index, value in enumerate(row)})
-            return rows
+            try:
+                sheet = workbook.active
+                # Cached dimensions are optional in XLSX. Use them only as a
+                # fast rejection path; forcing their calculation can scan an
+                # attacker-controlled sparse sheet before our limits apply.
+                if (sheet.max_column is not None and sheet.max_column > MAX_IMPORT_COLUMNS) or (
+                    sheet.max_row is not None and sheet.max_row > MAX_IMPORT_ROWS + 1
+                ):
+                    raise ValueError(
+                        f"Master files may contain at most {MAX_IMPORT_ROWS} rows and {MAX_IMPORT_COLUMNS} columns"
+                    )
+                iterator = sheet.iter_rows(values_only=True)
+                first_row = next(iterator, None)
+                if first_row is None:
+                    return []
+                headers = _headers(list(first_row))
+                rows: list[dict[str, str]] = []
+                for sheet_row_number, row in enumerate(iterator, start=2):
+                    # Count yielded worksheet rows, including blanks, so a
+                    # dimensionless sparse coordinate remains CPU-bounded.
+                    if sheet_row_number > MAX_IMPORT_ROWS + 1:
+                        raise ValueError(f"Master files may contain at most {MAX_IMPORT_ROWS} data rows")
+                    if len(row) > MAX_IMPORT_COLUMNS:
+                        raise ValueError(f"Master files may contain at most {MAX_IMPORT_COLUMNS} columns")
+                    if any(value not in (None, "") for value in row[len(headers) :]):
+                        raise ValueError("A data row contains more values than the header")
+                    if not any(value not in (None, "") for value in row):
+                        continue
+                    rows.append(
+                        {
+                            header: str((row[index] if index < len(row) else "") or "").strip()
+                            for index, header in enumerate(headers)
+                        }
+                    )
+                return rows
+            finally:
+                workbook.close()
         except (zipfile.BadZipFile, KeyError, OSError) as exc:
             raise ValueError("The XLSX file is malformed") from exc
     text = content.decode("utf-8-sig")

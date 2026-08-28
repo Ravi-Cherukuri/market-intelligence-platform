@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import base64
+import re
+import zipfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -20,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 import pytest
 import httpx
+from openpyxl import Workbook
 
 from app.domain.conversations import belongs_to_open_conversation, normalized_command
 from app.domain.identity import InvalidPhoneNumber, normalize_indian_whatsapp_number
@@ -45,10 +49,13 @@ from app.models import (
 )
 from app.security import verify_meta_signature
 from app.services.imports import (
+    MAX_IMPORT_COLUMNS,
+    MAX_IMPORT_ROWS,
     commit_employees,
     commit_prices,
     preview_employees,
     preview_prices,
+    read_tabular_upload,
 )
 from app.services.ingestion import ingest_whatsapp_message
 from app.services.signals import upsert_signal
@@ -725,6 +732,76 @@ def test_employee_master_api_previews_then_atomically_commits(
     employees = db_session.scalars(select(Employee).order_by(Employee.employee_code)).all()
     assert [employee.employee_code for employee in employees] == ["EMP-101", "EMP-102"]
     assert [employee.whatsapp_number for employee in employees] == ["919876543210", "919123456789"]
+
+
+def xlsx_without_dimension(rows: list[list[Any]], *, sparse_cell: tuple[int, int, Any] | None = None) -> bytes:
+    source = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+    if sparse_cell is not None:
+        sheet.cell(*sparse_cell)
+    workbook.save(source)
+
+    rewritten = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source.getvalue())) as archive, zipfile.ZipFile(rewritten, "w") as output:
+        for item in archive.infolist():
+            payload = archive.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                payload = re.sub(rb"<dimension[^>]*/>", b"", payload)
+            output.writestr(item, payload)
+    return rewritten.getvalue()
+
+
+def test_employee_master_accepts_xlsx_without_optional_dimension_cache() -> None:
+    """Streaming spreadsheet writers may omit worksheet dimension metadata."""
+    content = xlsx_without_dimension(
+        [
+            ["employee_code", "employment_type", "state", "whatsapp_number"],
+            ["PILOT001", "full_time", "Maharashtra", "+919820631696"],
+        ]
+    )
+
+    rows = read_tabular_upload("employees.xlsx", content)
+    assert rows == [
+        {
+            "employee_code": "PILOT001",
+            "employment_type": "full_time",
+            "state": "Maharashtra",
+            "whatsapp_number": "+919820631696",
+        }
+    ]
+
+
+def test_employee_master_accepts_empty_dimensionless_xlsx() -> None:
+    assert read_tabular_upload("employees.xlsx", xlsx_without_dimension([])) == []
+
+
+def test_employee_master_bounds_dimensionless_sparse_xlsx_iteration() -> None:
+    content = xlsx_without_dimension(
+        [["employee_code", "employment_type", "state", "whatsapp_number"]],
+        sparse_cell=(1_048_576, 1, "late-value"),
+    )
+    with pytest.raises(ValueError, match=f"at most {MAX_IMPORT_ROWS} data rows"):
+        read_tabular_upload("employees.xlsx", content)
+
+
+def test_employee_master_rejects_dimensionless_xlsx_wider_than_column_limit() -> None:
+    content = xlsx_without_dimension([[f"column_{index}" for index in range(MAX_IMPORT_COLUMNS + 1)]])
+    with pytest.raises(ValueError, match=f"at most {MAX_IMPORT_COLUMNS} columns"):
+        read_tabular_upload("employees.xlsx", content)
+
+
+def test_employee_master_rejects_dimensionless_xlsx_data_wider_than_header() -> None:
+    content = xlsx_without_dimension(
+        [
+            ["employee_code", "employment_type", "state", "whatsapp_number"],
+            ["PILOT001", "full_time", "Maharashtra", "+919820631696", "unexpected"],
+        ]
+    )
+    with pytest.raises(ValueError, match="more values than the header"):
+        read_tabular_upload("employees.xlsx", content)
 
 
 def test_employee_master_api_rejects_empty_file_without_writes(
