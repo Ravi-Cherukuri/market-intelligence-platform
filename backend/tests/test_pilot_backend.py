@@ -24,11 +24,13 @@ from sqlalchemy.orm import Session
 import pytest
 import httpx
 from openpyxl import Workbook
+from openai.lib._pydantic import to_strict_json_schema
 
 from app.domain.conversations import belongs_to_open_conversation, normalized_command
 from app.domain.identity import InvalidPhoneNumber, normalize_indian_whatsapp_number
 from app.domain.signals import EvidenceIdentity, classify_strength
 from app.ai.model_router import ModelRouter, QualityTier, TaskType
+from app.ai.schemas import ConversationExtraction, PriceObservation
 from app.models import (
     AuditEvent,
     Company,
@@ -1036,6 +1038,41 @@ def test_model_router_uses_task_quality_thresholds_and_explicit_tiers() -> None:
     assert router.upgrade(router.route(TaskType.EXTRACTION), TaskType.EXTRACTION).model == "gpt-5.6"
 
 
+def test_conversation_extraction_schema_avoids_unsupported_regex_lookaround() -> None:
+    """Keep the schema compatible with OpenAI Structured Outputs."""
+
+    strict_schema = to_strict_json_schema(ConversationExtraction)
+    encoded_schema = json.dumps(strict_schema)
+    assert "(?=" not in encoded_schema
+    assert "(?!" not in encoded_schema
+    assert "(?<=" not in encoded_schema
+    assert "(?<!" not in encoded_schema
+    assert strict_schema["$defs"]["PriceObservation"]["properties"]["amount"] == {
+        "anyOf": [
+            {
+                "exclusiveMinimum": 0,
+                "maximum": 999_999_999_999.99,
+                "multipleOf": 0.01,
+                "type": "number",
+            },
+            {"type": "null"},
+        ],
+        "title": "Amount",
+    }
+
+
+@pytest.mark.parametrize("amount", [0, 540.001, 1_000_000_000_000, float("inf"), float("nan")])
+def test_price_observation_rejects_values_that_cannot_be_persisted(amount: float) -> None:
+    with pytest.raises(ValueError):
+        PriceObservation(original_product_text="Synthetic product", amount=amount)
+
+
+@pytest.mark.parametrize("amount", [0.01, 540.1, 999_999_999_999.99])
+def test_price_observation_accepts_persistable_currency_values(amount: float) -> None:
+    parsed = PriceObservation(original_product_text="Synthetic product", amount=amount)
+    assert parsed.amount == amount
+
+
 def test_signal_becomes_strong_only_with_independent_employee_evidence_and_appends_price(
     db_session: Session,
 ) -> None:
@@ -1086,7 +1123,7 @@ def test_signal_becomes_strong_only_with_independent_employee_evidence_and_appen
                     "product_id": product.id,
                     "pack_size": "250 ml",
                     "price_type": "farmer_price",
-                    "amount": "540.00",
+                    "amount": 540.1,
                     "currency": "INR",
                 }
             },
@@ -1112,5 +1149,5 @@ def test_signal_becomes_strong_only_with_independent_employee_evidence_and_appen
     assert strong.distinct_employee_count == 2
     price = db_session.scalar(select(CompetitionPrice).where(CompetitionPrice.source == "strong_field_signal"))
     assert price is not None
-    assert price.amount == Decimal("540.00")
+    assert price.amount == Decimal("540.10")
     assert set(price.evidence_ids) == {first_observation.id, second_observation.id}

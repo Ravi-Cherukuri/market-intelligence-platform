@@ -1,6 +1,5 @@
 """Strict output contracts for untrusted field content."""
 
-from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -11,7 +10,17 @@ class PriceObservation(BaseModel):
     original_product_text: str
     pack_size: str | None = None
     price_type: Literal["farmer_price", "channel_net_landing"] | None = None
-    amount: Decimal | None = Field(default=None, gt=0)
+    # JSON Schema encodes constrained Decimal values as a regex that uses
+    # lookaround. OpenAI Structured Outputs rejects lookaround expressions, so
+    # accept a JSON number here and convert it to Decimal at the persistence
+    # boundary where exact currency arithmetic belongs.
+    amount: float | None = Field(
+        default=None,
+        gt=0,
+        le=999_999_999_999.99,
+        multiple_of=0.01,
+        allow_inf_nan=False,
+    )
     currency: str = "INR"
 
 
