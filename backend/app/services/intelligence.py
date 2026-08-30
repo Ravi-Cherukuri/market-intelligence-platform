@@ -95,7 +95,7 @@ def process_closed_conversation(
         )
         session.add(observation)
         session.flush()
-        upsert_signal(session, observation)
+        upsert_signal(session, observation, semantic_matcher=client)
         created += 1
     conversation.analysis_status = "processed"
     conversation.analysis_error_code = None

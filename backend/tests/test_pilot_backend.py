@@ -16,6 +16,7 @@ import re
 import zipfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -46,6 +47,8 @@ from app.models import (
     Product,
     ProductOwnership,
     CompetitionPrice,
+    PriceType,
+    Signal,
     SignalStrength,
     WhatsAppChannel,
 )
@@ -60,7 +63,7 @@ from app.services.imports import (
     read_tabular_upload,
 )
 from app.services.ingestion import ingest_whatsapp_message
-from app.services.signals import upsert_signal
+from app.services.signals import _has_identity_anchor_overlap, _identity_anchors, reconcile_semantic_duplicates, upsert_signal
 from app.integrations.whatsapp import (
     DownloadedMedia,
     WhatsAppClient,
@@ -1151,3 +1154,284 @@ def test_signal_becomes_strong_only_with_independent_employee_evidence_and_appen
     assert price is not None
     assert price.amount == Decimal("540.10")
     assert set(price.evidence_ids) == {first_observation.id, second_observation.id}
+
+
+class FakeSemanticMatcher:
+    """A deterministic stand-in for the probabilistic provider decision."""
+
+    def __init__(self, *, confidence: float, select_candidate: bool = True) -> None:
+        self.confidence = confidence
+        self.select_candidate = select_candidate
+        self.calls: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+
+    def match_signal(self, *, proposed: dict[str, object], candidates: list[dict[str, object]]):
+        self.calls.append((proposed, candidates))
+        return SimpleNamespace(
+            decision=SimpleNamespace(
+                candidate_signal_id=str(candidates[0]["id"]) if self.select_candidate else None,
+                confidence=self.confidence,
+                canonical_subject_key="bayer soybean 3-way mix herbicide",
+                rationale="Same Bayer soybean herbicide launch in Ahilyanagar.",
+            ),
+            profile=SimpleNamespace(provider="openai", model="test-semantic-model"),
+            input_tokens=17,
+            output_tokens=9,
+            latency_ms=12,
+        )
+
+
+def test_semantically_equivalent_signals_become_strong_with_high_confidence_matcher(db_session: Session) -> None:
+    company, _, employee_one = seed_company(db_session, name="Semantic Pilot", phone_number_id="semantic-channel")
+    employee_two = Employee(
+        company_id=company.id,
+        employee_code="EMP-002",
+        employment_type=EmploymentType.CONTRACTUAL,
+        state="Maharashtra",
+        whatsapp_number="919876543211",
+    )
+    db_session.add(employee_two)
+    db_session.flush()
+    conversations = [
+        FieldConversation(
+            company_id=company.id,
+            employee_id=employee_one.id,
+            started_at=BASE_TIME,
+            last_message_at=BASE_TIME,
+            employee_context={"state": "Maharashtra"},
+        ),
+        FieldConversation(
+            company_id=company.id,
+            employee_id=employee_two.id,
+            started_at=BASE_TIME,
+            last_message_at=BASE_TIME,
+            employee_context={"state": "Maharashtra"},
+        ),
+    ]
+    db_session.add_all(conversations)
+    db_session.flush()
+
+    first = Observation(
+        company_id=company.id,
+        employee_id=employee_one.id,
+        conversation_id=conversations[0].id,
+        state="Maharashtra",
+        category="new_launches",
+        subject_key="bayer soybean 3-way mix herbicide",
+        claim="Bayer is launching a soybean 3-way mix herbicide in Ahilyanagar at about Rs 950 per acre.",
+        structured_data={"mentioned_crops": ["soybean"]},
+        confidence=Decimal("0.90"),
+        source_message_ids=["message-1"],
+    )
+    second = Observation(
+        company_id=company.id,
+        employee_id=employee_two.id,
+        conversation_id=conversations[1].id,
+        state="Maharashtra",
+        category="new_launches",
+        subject_key="bayer soybean three-way mix herbicide",
+        claim="A Bayer soybean three-way-mix herbicide is new in Ahilyanagar, priced around Rs 900 to 1,000 per acre.",
+        structured_data={"mentioned_crops": ["soybean"]},
+        confidence=Decimal("0.90"),
+        source_message_ids=["message-2"],
+    )
+    db_session.add(first)
+    db_session.flush()
+    initial = upsert_signal(db_session, first)
+    db_session.add(second)
+    db_session.flush()
+    matcher = FakeSemanticMatcher(confidence=0.91)
+    matched = upsert_signal(db_session, second, semantic_matcher=matcher)
+    db_session.commit()
+
+    assert matched.id == initial.id
+    assert matched.strength == SignalStrength.STRONG
+    assert matched.distinct_employee_count == 2
+    assert second.subject_key == "bayer soybean three-way mix herbicide"
+    assert len(matcher.calls) == 1
+    audit = db_session.scalar(select(AuditEvent).where(AuditEvent.event_type == "signal.semantic_match"))
+    assert audit is not None
+    assert audit.metadata_json["accepted"] is True
+    assert audit.metadata_json["confidence"] == 0.91
+
+
+def test_identity_anchor_guard_accepts_three_way_variant_but_rejects_only_topical_similarity() -> None:
+    candidate = SimpleNamespace(
+        subject_key="bayer soybean three-way herbicide",
+        title="Bayer soybean three-way herbicide launch",
+        summary="Bayer soybean three-way herbicide launch in Ahilyanagar.",
+    )
+    proposed = {
+        "subject_key": "bayer soybean 3-way herbicide",
+        "claim": "Bayer soybean 3-way herbicide launch in Ahilyanagar.",
+        "structured_data": {},
+    }
+    unrelated = {
+        "subject_key": "rival cotton herbicide launch",
+        "claim": "A rival herbicide is new for cotton.",
+        "structured_data": {},
+    }
+
+    assert {"bayer", "soybean", "3"}.issubset(_identity_anchors(proposed["subject_key"]))
+    assert _has_identity_anchor_overlap(proposed, candidate)
+    assert not _has_identity_anchor_overlap(unrelated, candidate)
+
+
+def test_semantic_matcher_does_not_merge_below_confidence_threshold(db_session: Session) -> None:
+    company, _, employee_one = seed_company(db_session, name="Semantic Threshold", phone_number_id="threshold-channel")
+    employee_two = Employee(
+        company_id=company.id,
+        employee_code="EMP-002",
+        employment_type=EmploymentType.CONTRACTUAL,
+        state="Maharashtra",
+        whatsapp_number="919876543211",
+    )
+    db_session.add(employee_two)
+    db_session.flush()
+    first_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_one.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    second_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_two.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    db_session.add_all([first_conversation, second_conversation])
+    db_session.flush()
+    first = Observation(
+        company_id=company.id,
+        employee_id=employee_one.id,
+        conversation_id=first_conversation.id,
+        state="Maharashtra",
+        category="new_launches",
+        subject_key="bayer soybean 3-way mix herbicide",
+        claim="Bayer soybean herbicide launch.",
+        structured_data={},
+        confidence=Decimal("0.90"),
+        source_message_ids=["message-1"],
+    )
+    second = Observation(
+        company_id=company.id,
+        employee_id=employee_two.id,
+        conversation_id=second_conversation.id,
+        state="Maharashtra",
+        category="new_launches",
+        subject_key="bayer soybean three-way mix herbicide",
+        claim="Possibly a different Bayer soybean herbicide launch.",
+        structured_data={},
+        confidence=Decimal("0.60"),
+        source_message_ids=["message-2"],
+    )
+    db_session.add(first)
+    db_session.flush()
+    upsert_signal(db_session, first)
+    db_session.add(second)
+    db_session.flush()
+    unmatched = upsert_signal(db_session, second, semantic_matcher=FakeSemanticMatcher(confidence=0.84))
+    db_session.commit()
+
+    assert unmatched.strength == SignalStrength.WEAK
+    assert db_session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "signal.semantic_match")) == 1
+    audit = db_session.scalar(select(AuditEvent).where(AuditEvent.event_type == "signal.semantic_match"))
+    assert audit is not None
+    assert audit.metadata_json["accepted"] is False
+
+
+def test_reconciliation_merges_existing_semantic_duplicates_without_losing_evidence(db_session: Session) -> None:
+    company, _, employee_one = seed_company(db_session, name="Reconciliation Pilot", phone_number_id="reconcile-channel")
+    employee_two = Employee(
+        company_id=company.id,
+        employee_code="EMP-002",
+        employment_type=EmploymentType.CONTRACTUAL,
+        state="Maharashtra",
+        whatsapp_number="919876543211",
+    )
+    db_session.add(employee_two)
+    db_session.flush()
+    first_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_one.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    second_conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee_two.id,
+        started_at=BASE_TIME,
+        last_message_at=BASE_TIME,
+        employee_context={"state": "Maharashtra"},
+    )
+    db_session.add_all([first_conversation, second_conversation])
+    db_session.flush()
+    observations = [
+        Observation(
+            company_id=company.id,
+            employee_id=employee_one.id,
+            conversation_id=first_conversation.id,
+            state="Maharashtra",
+            category="new_launches",
+            subject_key="bayer soybean 3-way mix herbicide",
+            claim="Bayer soybean three-way herbicide launch in Ahilyanagar.",
+            structured_data={},
+            confidence=Decimal("0.90"),
+            source_message_ids=["message-1"],
+        ),
+        Observation(
+            company_id=company.id,
+            employee_id=employee_two.id,
+            conversation_id=second_conversation.id,
+            state="Maharashtra",
+            category="new_launches",
+            subject_key="bayer soybean three-way mix herbicide",
+            claim="New Bayer soybean 3-way-mix herbicide in Ahilyanagar.",
+            structured_data={},
+            confidence=Decimal("0.90"),
+            source_message_ids=["message-2"],
+        ),
+    ]
+    db_session.add_all(observations)
+    db_session.flush()
+    upsert_signal(db_session, observations[0])
+    duplicate_signal = upsert_signal(db_session, observations[1])
+    assert db_session.scalar(select(func.count()).select_from(Signal)) == 2
+    product = Product(
+        company_id=company.id,
+        ownership=ProductOwnership.COMPETITOR,
+        brand="Bayer 3-way mix",
+        category="herbicide",
+    )
+    db_session.add(product)
+    db_session.flush()
+    historical_price = CompetitionPrice(
+        company_id=company.id,
+        product_id=product.id,
+        state="Maharashtra",
+        pack_size="per acre",
+        price_type=PriceType.FARMER,
+        amount=Decimal("950.00"),
+        currency="INR",
+        observed_at=BASE_TIME,
+        source="strong_field_signal",
+        signal_id=duplicate_signal.id,
+        evidence_ids=[observations[1].id],
+    )
+    db_session.add(historical_price)
+
+    merged = reconcile_semantic_duplicates(db_session, company.id, FakeSemanticMatcher(confidence=0.95))
+    db_session.commit()
+
+    assert merged == 1
+    reconciled = db_session.scalar(select(Signal).where(Signal.company_id == company.id))
+    assert reconciled is not None
+    assert reconciled.strength == SignalStrength.STRONG
+    assert reconciled.distinct_employee_count == 2
+    retained_price = db_session.get(CompetitionPrice, historical_price.id)
+    assert retained_price is not None
+    assert retained_price.signal_id == reconciled.id
+    assert db_session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "signal.semantic_merged")) == 1

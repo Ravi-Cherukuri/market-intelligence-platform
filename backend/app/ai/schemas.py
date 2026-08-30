@@ -53,6 +53,19 @@ class ConversationExtraction(BaseModel):
     warnings: list[str] = []
 
 
+class SignalMatchDecision(BaseModel):
+    """A constrained semantic-match decision for one incoming observation.
+
+    The model chooses from application-supplied candidate IDs only. The service
+    validates the ID again before it can affect a derived signal projection.
+    """
+
+    candidate_signal_id: str | None = None
+    confidence: float = Field(ge=0, le=1)
+    canonical_subject_key: str = Field(min_length=3, max_length=300)
+    rationale: str = Field(min_length=3, max_length=400)
+
+
 class ImageEvidence(BaseModel):
     description: str
     visible_text: str = ""
