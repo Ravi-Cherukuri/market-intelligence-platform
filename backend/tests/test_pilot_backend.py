@@ -1522,6 +1522,8 @@ def test_weekly_intelligence_is_evidence_backed_and_cached_by_fingerprint(db_ses
         structured_data={"mentioned_crops": ["soybean"]},
         confidence=Decimal("0.92"),
         source_message_ids=["weekly-message"],
+        created_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
     db_session.add(observation)
     db_session.flush()
