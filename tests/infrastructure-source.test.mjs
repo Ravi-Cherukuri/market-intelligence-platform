@@ -154,6 +154,11 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
     apiDockerfile,
     /^FROM python:3\.12\.14-alpine3\.24@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a$/m,
   );
+  assert.equal(
+    webDockerfile.match(/FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32/g)?.length,
+    3,
+  );
+  assert.equal(webDockerfile.match(/RUN apk upgrade --no-cache/g)?.length, 3);
   assert.match(apiDockerfile, /addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app/);
   assert.doesNotMatch(apiDockerfile, /python:3\.12-slim|addgroup --system|adduser --system/);
   assert.match(build, /API_RUNTIME_UID=\$\(docker run --rm --platform linux\/arm64/);
