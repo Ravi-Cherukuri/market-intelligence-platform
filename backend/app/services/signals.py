@@ -71,14 +71,19 @@ def upsert_signal(
     *,
     semantic_matcher: SignalMatcher | None = None,
 ) -> Signal:
-    signal = session.scalar(
-        select(Signal).where(
+    scoped_subject_key = f"{observation.business_scope.value}:{observation.subject_key}"
+    signal = session.execute(
+        select(Signal)
+        .join(SignalEvidence, SignalEvidence.signal_id == Signal.id)
+        .join(Observation, Observation.id == SignalEvidence.observation_id)
+        .where(
             Signal.company_id == observation.company_id,
             Signal.state == observation.state,
             Signal.category == observation.category,
-            Signal.subject_key == observation.subject_key,
+            Signal.subject_key.in_((observation.subject_key, scoped_subject_key)),
+            Observation.business_scope == observation.business_scope,
         )
-    )
+    ).unique().scalar_one_or_none()
     now = datetime.now(timezone.utc)
     if signal is None and semantic_matcher is not None:
         signal = _find_semantic_match(session, observation, semantic_matcher, now)
@@ -87,7 +92,10 @@ def upsert_signal(
             company_id=observation.company_id,
             state=observation.state,
             category=observation.category,
-            subject_key=observation.subject_key,
+            # Scope is part of signal identity. Prefixing the internal key keeps
+            # the existing non-destructive unique constraint valid while old
+            # pilot signals remain readable and matchable.
+            subject_key=scoped_subject_key,
             title=observation.claim[:300],
             summary=observation.claim,
             strength=SignalStrength.WEAK,
@@ -150,14 +158,17 @@ def _find_semantic_match(
     candidates = list(
         session.scalars(
             select(Signal)
+            .join(SignalEvidence, SignalEvidence.signal_id == Signal.id)
+            .join(Observation, Observation.id == SignalEvidence.observation_id)
             .where(
                 Signal.company_id == observation.company_id,
                 Signal.state == observation.state,
                 Signal.category == observation.category,
                 Signal.last_seen_at >= now - timedelta(days=30),
+                Observation.business_scope == observation.business_scope,
             )
             .order_by(Signal.last_seen_at.desc())
-        )
+        ).unique()
     )
     proposed = {
         "state": observation.state,
@@ -252,6 +263,13 @@ def reconcile_semantic_duplicates(session: Session, company_id: str, matcher: Si
             .order_by(Signal.first_seen_at, Signal.id)
         )
     )
+    signal_scopes: dict[str, set[object]] = defaultdict(set)
+    for signal_id, scope in session.execute(
+        select(SignalEvidence.signal_id, Observation.business_scope).join(
+            Observation, Observation.id == SignalEvidence.observation_id
+        )
+    ):
+        signal_scopes[signal_id].add(scope)
     merged = 0
     for duplicate in signals:
         if session.get(Signal, duplicate.id) is None:
@@ -270,6 +288,7 @@ def reconcile_semantic_duplicates(session: Session, company_id: str, matcher: Si
             and session.get(Signal, candidate.id) is not None
             and candidate.state == duplicate.state
             and candidate.category == duplicate.category
+            and signal_scopes[candidate.id] == signal_scopes[duplicate.id]
             and _utc(candidate.first_seen_at) <= _utc(duplicate.first_seen_at)
             and _utc(candidate.last_seen_at) >= _utc(duplicate.first_seen_at) - timedelta(days=30)
             and _has_identity_anchor_overlap(proposed, candidate)

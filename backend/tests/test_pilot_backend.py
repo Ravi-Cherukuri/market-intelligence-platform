@@ -14,7 +14,7 @@ import json
 import base64
 import re
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -31,9 +31,10 @@ from app.domain.conversations import belongs_to_open_conversation, normalized_co
 from app.domain.identity import InvalidPhoneNumber, normalize_indian_whatsapp_number
 from app.domain.signals import EvidenceIdentity, classify_strength
 from app.ai.model_router import ModelRouter, QualityTier, TaskType
-from app.ai.schemas import ConversationExtraction, PriceObservation
+from app.ai.schemas import ConversationExtraction, PriceObservation, WeeklyIntelligenceSynthesis
 from app.models import (
     AuditEvent,
+    BusinessScope,
     Company,
     ConversationStatus,
     Employee,
@@ -49,7 +50,9 @@ from app.models import (
     CompetitionPrice,
     PriceType,
     Signal,
+    SignalEvidence,
     SignalStrength,
+    WeeklyBrief,
     WhatsAppChannel,
 )
 from app.security import verify_meta_signature
@@ -64,6 +67,7 @@ from app.services.imports import (
 )
 from app.services.ingestion import ingest_whatsapp_message
 from app.services.signals import _has_identity_anchor_overlap, _identity_anchors, reconcile_semantic_duplicates, upsert_signal
+from app.services.weekly_intelligence import get_weekly_intelligence
 from app.integrations.whatsapp import (
     DownloadedMedia,
     WhatsAppClient,
@@ -1254,6 +1258,64 @@ def test_semantically_equivalent_signals_become_strong_with_high_confidence_matc
     assert audit.metadata_json["confidence"] == 0.91
 
 
+def test_signal_matching_never_combines_own_and_competitor_business_scopes(db_session: Session) -> None:
+    company, _, employee_one = seed_company(db_session, name="Scope Pilot", phone_number_id="scope-channel")
+    employee_two = Employee(
+        company_id=company.id,
+        employee_code="EMP-002",
+        employment_type=EmploymentType.CONTRACTUAL,
+        state="Maharashtra",
+        whatsapp_number="919876543211",
+    )
+    db_session.add(employee_two)
+    db_session.flush()
+    conversations = [
+        FieldConversation(
+            company_id=company.id,
+            employee_id=employee.id,
+            started_at=BASE_TIME,
+            last_message_at=BASE_TIME,
+            employee_context={"state": "Maharashtra"},
+        )
+        for employee in (employee_one, employee_two)
+    ]
+    db_session.add_all(conversations)
+    db_session.flush()
+    observations = [
+        Observation(
+            company_id=company.id,
+            employee_id=employee.id,
+            conversation_id=conversation.id,
+            state="Maharashtra",
+            category="product_acceptance",
+            business_scope=scope,
+            subject_key="soybean herbicide acceptance",
+            claim=claim,
+            structured_data={},
+            confidence=Decimal("0.90"),
+            source_message_ids=[f"message-{index}"],
+        )
+        for index, (employee, conversation, scope, claim) in enumerate(
+            (
+                (employee_one, conversations[0], BusinessScope.OWN_BUSINESS, "Our soybean herbicide is gaining acceptance."),
+                (employee_two, conversations[1], BusinessScope.COMPETITOR, "A competitor soybean herbicide is gaining acceptance."),
+            ),
+            start=1,
+        )
+    ]
+    matcher = FakeSemanticMatcher(confidence=0.99)
+    created_signals = []
+    for observation in observations:
+        db_session.add(observation)
+        db_session.flush()
+        created_signals.append(upsert_signal(db_session, observation, semantic_matcher=matcher))
+    db_session.commit()
+
+    assert created_signals[0].id != created_signals[1].id
+    assert db_session.scalar(select(func.count()).select_from(Signal)) == 2
+    assert matcher.calls == []
+
+
 def test_identity_anchor_guard_accepts_three_way_variant_but_rejects_only_topical_similarity() -> None:
     candidate = SimpleNamespace(
         subject_key="bayer soybean three-way herbicide",
@@ -1435,3 +1497,153 @@ def test_reconciliation_merges_existing_semantic_duplicates_without_losing_evide
     assert retained_price is not None
     assert retained_price.signal_id == reconciled.id
     assert db_session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "signal.semantic_merged")) == 1
+
+
+def test_weekly_intelligence_is_evidence_backed_and_cached_by_fingerprint(db_session: Session) -> None:
+    company, _, employee = seed_company(db_session, name="Weekly Pilot", phone_number_id="weekly-channel")
+    conversation = FieldConversation(
+        company_id=company.id,
+        employee_id=employee.id,
+        started_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+        employee_context={"state": "Maharashtra"},
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    observation = Observation(
+        company_id=company.id,
+        employee_id=employee.id,
+        conversation_id=conversation.id,
+        state="Maharashtra",
+        category="new_launches",
+        business_scope=BusinessScope.COMPETITOR,
+        subject_key="bayer soybean 3-way herbicide",
+        claim="Bayer launched a soybean 3-way herbicide in Maharashtra.",
+        structured_data={"mentioned_crops": ["soybean"]},
+        confidence=Decimal("0.92"),
+        source_message_ids=["weekly-message"],
+    )
+    db_session.add(observation)
+    db_session.flush()
+    signal = upsert_signal(db_session, observation)
+    historical_observation = Observation(
+        company_id=company.id,
+        employee_id=employee.id,
+        conversation_id=conversation.id,
+        state="Maharashtra",
+        category="new_launches",
+        business_scope=BusinessScope.COMPETITOR,
+        subject_key="bayer soybean 3-way herbicide",
+        claim="Historical claim outside the selected seven-day window.",
+        structured_data={},
+        confidence=Decimal("0.80"),
+        source_message_ids=["historical-message"],
+        created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(historical_observation)
+    db_session.flush()
+    db_session.add(
+        SignalEvidence(
+            company_id=company.id,
+            signal_id=signal.id,
+            observation_id=historical_observation.id,
+            employee_id=employee.id,
+            conversation_id=conversation.id,
+        )
+    )
+    db_session.flush()
+
+    class FakeWeeklyClient:
+        calls = 0
+        supplied_signals: list[dict[str, object]] = []
+
+        def synthesize_weekly_intelligence(self, **kwargs: object):
+            self.calls += 1
+            self.supplied_signals = list(kwargs["signal_payload"])
+            return SimpleNamespace(
+                synthesis=WeeklyIntelligenceSynthesis(
+                    summary="Bayer's soybean herbicide launch was the week's principal competitive signal.",
+                    opportunities=[
+                        {
+                            "title": "Prepare a channel response",
+                            "detail": "Use the launch evidence to brief the Maharashtra sales team.",
+                            "business_scope": "competitor",
+                            "signal_ids": [signal.id],
+                        }
+                    ],
+                    threats=[],
+                    word_cloud=[{"term": "soybean", "weight": 90}, {"term": "Bayer", "weight": 75}],
+                    source_signal_ids=[signal.id],
+                ),
+                profile=SimpleNamespace(provider="openai", model="test-weekly-model"),
+                input_tokens=100,
+                output_tokens=50,
+                latency_ms=20,
+            )
+
+    intelligence = FakeWeeklyClient()
+    first = get_weekly_intelligence(
+        db_session,
+        company,
+        intelligence,
+        week_ending=date(2026, 8, 30),
+        state="Maharashtra",
+        business_scope="competitor",
+    )
+    second = get_weekly_intelligence(
+        db_session,
+        company,
+        intelligence,
+        week_ending=date(2026, 8, 30),
+        state="Maharashtra",
+        business_scope="competitor",
+    )
+    later_observation = Observation(
+        company_id=company.id,
+        employee_id=employee.id,
+        conversation_id=conversation.id,
+        state="Maharashtra",
+        category="new_launches",
+        business_scope=BusinessScope.COMPETITOR,
+        subject_key="bayer soybean 3-way herbicide",
+        claim="A later update outside the historical week.",
+        structured_data={},
+        confidence=Decimal("0.90"),
+        source_message_ids=["later-message"],
+        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(later_observation)
+    db_session.flush()
+    db_session.add(
+        SignalEvidence(
+            company_id=company.id,
+            signal_id=signal.id,
+            observation_id=later_observation.id,
+            employee_id=employee.id,
+            conversation_id=conversation.id,
+        )
+    )
+    signal.last_seen_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    db_session.flush()
+    historical_after_update = get_weekly_intelligence(
+        db_session,
+        company,
+        intelligence,
+        week_ending=date(2026, 8, 30),
+        state="Maharashtra",
+        business_scope="competitor",
+    )
+
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert intelligence.calls == 1
+    assert historical_after_update["cached"] is True
+    assert historical_after_update["signal_count"] == 1
+    assert first["summary"].startswith("Bayer's soybean")
+    assert first["opportunities"][0]["signal_ids"] == [signal.id]
+    assert first["evidence"][0]["evidence"][0]["employee_code"] == employee.employee_code
+    assert "Historical claim" not in json.dumps(intelligence.supplied_signals)
+    assert "Historical claim" not in json.dumps(first["evidence"])
+    assert db_session.scalar(select(func.count()).select_from(WeeklyBrief)) == 1

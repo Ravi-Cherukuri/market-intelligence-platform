@@ -69,6 +69,11 @@ class SignalStrength(str, enum.Enum):
     STRONG = "strong"
 
 
+class BusinessScope(str, enum.Enum):
+    OWN_BUSINESS = "own_business"
+    COMPETITOR = "competitor"
+
+
 class Company(Base, TimestampMixin):
     __tablename__ = "companies"
 
@@ -287,6 +292,9 @@ class Observation(Base, TimestampMixin):
     employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
     state: Mapped[str] = mapped_column(String(100), nullable=False)
     category: Mapped[str] = mapped_column(String(80), nullable=False)
+    business_scope: Mapped[BusinessScope] = mapped_column(
+        Enum(BusinessScope, native_enum=False), default=BusinessScope.COMPETITOR, nullable=False
+    )
     subject_key: Mapped[str] = mapped_column(String(300), nullable=False)
     claim: Mapped[str] = mapped_column(Text, nullable=False)
     structured_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
@@ -342,6 +350,29 @@ class AiOperation(Base, TimestampMixin):
     estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     latency_ms: Mapped[int | None]
     error_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class WeeklyBrief(Base, TimestampMixin):
+    """Cached, evidence-fingerprinted dashboard synthesis."""
+
+    __tablename__ = "weekly_briefs"
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "state_scope", "business_scope", "period_end", "source_fingerprint",
+            name="uq_weekly_brief_fingerprint",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), nullable=False, index=True)
+    state_scope: Mapped[str] = mapped_column(String(100), nullable=False)
+    business_scope: Mapped[str] = mapped_column(String(30), nullable=False)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(40))
+    model: Mapped[str | None] = mapped_column(String(120))
 
 
 class RetentionPolicy(Base, TimestampMixin):

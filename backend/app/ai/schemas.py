@@ -25,6 +25,7 @@ class PriceObservation(BaseModel):
 
 
 class ExtractedObservation(BaseModel):
+    business_scope: Literal["own_business", "competitor"]
     category: Literal[
         "pricing_schemes",
         "availability_inventory",
@@ -36,6 +37,12 @@ class ExtractedObservation(BaseModel):
         "channel_credit",
         "regulatory_label",
         "own_execution",
+        "product_acceptance",
+        "demand_movement",
+        "customer_complaints",
+        "competitor_initiatives",
+        "new_services",
+        "staffing_changes",
     ]
     state: str
     subject_key: str = Field(min_length=3, max_length=300)
@@ -64,6 +71,26 @@ class SignalMatchDecision(BaseModel):
     confidence: float = Field(ge=0, le=1)
     canonical_subject_key: str = Field(min_length=3, max_length=300)
     rationale: str = Field(min_length=3, max_length=400)
+
+
+class WeeklyInsight(BaseModel):
+    title: str = Field(min_length=3, max_length=120)
+    detail: str = Field(min_length=3, max_length=360)
+    business_scope: Literal["own_business", "competitor"]
+    signal_ids: list[str]
+
+
+class WordCloudTerm(BaseModel):
+    term: str = Field(min_length=2, max_length=50)
+    weight: int = Field(ge=1, le=100)
+
+
+class WeeklyIntelligenceSynthesis(BaseModel):
+    summary: str = Field(min_length=3, max_length=900)
+    opportunities: list[WeeklyInsight]
+    threats: list[WeeklyInsight]
+    word_cloud: list[WordCloudTerm]
+    source_signal_ids: list[str]
 
 
 class ImageEvidence(BaseModel):

@@ -5,21 +5,33 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("dashboard represents the agreed pilot workflows", async () => {
-  const page = await readFile(new URL("app/page.tsx", root), "utf8");
+  const [page, uploads] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("app/components/master-uploads.tsx", root), "utf8"),
+  ]);
   for (const expected of [
-    "Signals",
-    "Evidence inbox",
-    "Intelligence studio",
-    "Employees & territories",
-    "Product masters",
-    "Data retention",
+    "Weekly intelligence",
+    "Rolling seven-day view",
+    "All intelligence",
+    "Own business",
+    "Competitors",
+    "Biggest opportunities",
+    "Biggest threats",
+    "This week in words",
+    "Supporting field evidence",
+    "Download brief",
+    "Admin setup",
     "WhatsApp channel",
   ]) {
     assert.match(page, new RegExp(expected, "i"));
   }
-  assert.match(page, /Strong/);
-  assert.match(page, /Weak/);
-  assert.match(page, /employee/i);
+  assert.match(page, /weekly-intelligence/);
+  assert.match(page, /week_ending/);
+  assert.match(page, /business_scope/);
+  assert.match(page, /Country/);
+  assert.match(page, /State/);
+  assert.match(page, /employee_code/);
+  assert.match(uploads, /Upload employee master/i);
 });
 
 test("starter and deployment-specific Cloudflare metadata are removed", async () => {

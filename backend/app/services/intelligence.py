@@ -9,7 +9,16 @@ from sqlalchemy.orm import Session
 
 from app.ai.model_router import QualityTier
 from app.ai.openai_client import OpenAIIntelligenceClient
-from app.models import AiOperation, FieldConversation, FieldMessage, Observation, Product
+from app.models import (
+    AiOperation,
+    BusinessScope,
+    Company,
+    FieldConversation,
+    FieldMessage,
+    Observation,
+    Product,
+    ProductOwnership,
+)
 from app.services.signals import upsert_signal
 
 
@@ -44,9 +53,24 @@ def process_closed_conversation(
         return 0
 
     try:
+        company = session.get(Company, conversation.company_id)
+        own_product_names = list(
+            session.scalars(
+                select(Product.brand)
+                .where(
+                    Product.company_id == conversation.company_id,
+                    Product.ownership == ProductOwnership.OWN,
+                    Product.active.is_(True),
+                )
+                .order_by(Product.brand)
+                .limit(100)
+            )
+        )
         run = client.extract_conversation(
             evidence_text=_conversation_evidence(messages),
             default_state=str(conversation.employee_context["state"]),
+            company_name=company.name if company else "the reporting company",
+            own_product_names=own_product_names,
             tier=tier,
         )
     except Exception as exc:
@@ -87,6 +111,7 @@ def process_closed_conversation(
             employee_id=conversation.employee_id,
             state=extracted.state or str(conversation.employee_context["state"]),
             category=extracted.category,
+            business_scope=BusinessScope(extracted.business_scope),
             subject_key=extracted.subject_key.casefold().strip(),
             claim=extracted.factual_claim,
             structured_data=data,

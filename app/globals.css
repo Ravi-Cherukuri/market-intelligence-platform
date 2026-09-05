@@ -172,3 +172,40 @@ nav { display: grid; gap: 4px; }
   .setup-strip { display: block; }.upload-actions { justify-content: flex-start; margin-top: 13px; }
   .review-actions { align-items: flex-start; flex-direction: column; }
 }
+
+/* Weekly intelligence MVP */
+.weekly-content { max-width: 1320px; }
+.channel-health.live .status-dot { background: #86bc72; box-shadow: 0 0 0 4px rgba(134,188,114,.13); }
+.intelligence-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 14px; padding: 15px 17px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 13px; background: white; }
+.control-group, .select-control { display: grid; gap: 7px; }
+.control-group > span, .select-control > span { color: #77847d; font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.choice-row { display: flex; gap: 3px; padding: 3px; border-radius: 8px; background: #edf1ee; }
+.choice { min-height: 32px; padding: 0 11px; color: #66736c; border: 0; border-radius: 6px; background: transparent; font-size: 10px; font-weight: 750; cursor: pointer; }
+.choice.active { color: var(--forest); background: white; box-shadow: 0 1px 5px rgba(15,55,37,.09); }
+.scope-control { margin-left: auto; }
+.select-control select, .select-control input { height: 38px; min-width: 155px; padding: 0 11px; color: var(--ink); border: 1px solid #d7e0da; border-radius: 8px; background: #fbfcfb; font: 600 11px inherit; }
+.weekly-hero { display: grid; grid-template-columns: minmax(0, 1fr) 180px; gap: 30px; padding: 30px 32px; color: white; border-radius: 17px; background: radial-gradient(circle at 92% 0, rgba(217,239,176,.3), transparent 35%), linear-gradient(125deg, #174c35, #0d3525); box-shadow: 0 18px 36px rgba(23,76,53,.14); }
+.weekly-hero .eyebrow { color: #bcd0c3; }
+.weekly-hero h2 { margin: 8px 0 12px; font: 30px Georgia, serif; }
+.weekly-summary { max-width: 850px; margin: 0; color: #d4e2d8; font: 15px/1.7 Georgia, serif; }
+.brief-provenance { display: flex; flex-direction: column; justify-content: center; padding-left: 26px; border-left: 1px solid rgba(255,255,255,.18); }
+.brief-provenance strong { font: 38px Georgia, serif; }.brief-provenance span { color: #d3e0d7; font-size: 11px; }.brief-provenance small { margin-top: 11px; color: #9eb7a9; font-size: 9px; }
+.opportunity-threat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px; }
+.weekly-card { padding: 23px; border: 1px solid var(--line); border-radius: 14px; background: white; }
+.weekly-card-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 11px; }
+.weekly-card-heading h2 { margin: 4px 0 0; font: 21px Georgia, serif; }
+.card-symbol { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 10px; color: #285b3f; background: #e4f0e5; font: 700 18px Georgia, serif; }
+.threat-card .card-symbol { color: #8a4f42; background: #f6e6e2; }.card-symbol.cloud { color: #445e76; background: #e7eef3; font-size: 12px; }
+.ranked-insight { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) 20px; gap: 11px; padding: 15px 0; color: inherit; text-align: left; border: 0; border-top: 1px solid #e9eeea; background: transparent; cursor: pointer; }
+.ranked-insight:hover strong { color: var(--forest); }.rank { padding-top: 1px; color: #97a49c; font: 16px Georgia, serif; }.ranked-insight strong { font-size: 12px; }.ranked-insight p { margin: 5px 0 7px; color: var(--muted); font-size: 10px; line-height: 1.55; }.ranked-insight small { color: #7e8c84; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; }.insight-arrow { align-self: center; color: #819087; font-size: 17px; }
+.word-cloud-card { margin-top: 15px; }.word-cloud { min-height: 135px; display: flex; align-items: center; justify-content: center; align-content: center; flex-wrap: wrap; gap: 10px 18px; padding: 17px 35px; color: var(--forest); font-family: Georgia, serif; }.word-cloud span:nth-child(3n+2) { color: #9a622f; }.word-cloud span:nth-child(4n) { color: #4f6d82; }
+.empty-intelligence { margin: 14px 0 0; padding: 18px 0; color: #839088; border-top: 1px solid #e9eeea; font-size: 10px; }
+.brief-loading, .dashboard-error { min-height: 220px; display: flex; align-items: center; justify-content: center; gap: 13px; padding: 30px; border: 1px solid var(--line); border-radius: 14px; background: white; }
+.brief-loading div { display: grid; gap: 4px; }.brief-loading strong { font: 18px Georgia, serif; }.brief-loading small { color: var(--muted); font-size: 10px; }
+.dashboard-error { display: block; min-height: 0; color: #7b4037; border-color: #ecd4cf; background: #fff7f5; }.dashboard-error p { font-size: 11px; }
+.evidence-backdrop { position: fixed; z-index: 30; inset: 0; display: flex; justify-content: flex-end; background: rgba(8,25,17,.58); backdrop-filter: blur(3px); }
+.evidence-drawer { width: min(560px, 94vw); height: 100%; overflow: auto; padding: 30px; background: #f7f9f7; box-shadow: -25px 0 70px rgba(8,25,17,.24); }
+.evidence-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 22px; }.evidence-heading h2 { margin: 6px 0 8px; font: 25px Georgia, serif; }.evidence-heading p:not(.eyebrow) { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.evidence-signal { margin-top: 14px; padding: 19px; border: 1px solid var(--line); border-radius: 12px; background: white; }.evidence-signal-title { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }.evidence-signal-title strong { font-size: 12px; }.evidence-signal blockquote { margin: 14px 0 0; padding: 13px 14px; border-left: 3px solid #a8beaf; background: #f5f8f6; }.evidence-signal blockquote p { margin: 0; color: #405048; font: 12px/1.55 Georgia, serif; }.evidence-signal blockquote footer { margin-top: 8px; color: #77847d; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; }
+@media (max-width: 900px) { .opportunity-threat-grid { grid-template-columns: 1fr; }.scope-control { margin-left: 0; }.weekly-hero { grid-template-columns: 1fr; }.brief-provenance { padding: 15px 0 0; border: 0; border-top: 1px solid rgba(255,255,255,.18); } }
+@media (max-width: 720px) { .weekly-topbar { align-items: flex-start; gap: 14px; }.weekly-topbar .top-actions { display: flex; }.weekly-topbar .quiet-button { display: none; }.intelligence-controls { align-items: stretch; }.scope-control, .select-control { width: 100%; }.choice-row { overflow-x: auto; }.choice { white-space: nowrap; }.select-control select, .select-control input { width: 100%; }.weekly-hero { padding: 24px; }.weekly-card { padding: 18px; } }
