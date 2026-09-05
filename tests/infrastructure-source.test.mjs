@@ -152,7 +152,7 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
   assert.match(build, /--platform linux\/arm64/);
   assert.match(
     apiDockerfile,
-    /^FROM python:3\.12\.14-alpine3\.24@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31$/m,
+    /^FROM python:3\.12\.14-alpine3\.24@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a$/m,
   );
   assert.match(apiDockerfile, /addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app/);
   assert.doesNotMatch(apiDockerfile, /python:3\.12-slim|addgroup --system|adduser --system/);
