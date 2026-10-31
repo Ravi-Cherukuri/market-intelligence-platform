@@ -1,0 +1,5 @@
+FROM caddy:2-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
+
+# Keep the edge proxy minimal and rebuild Alpine packages at release time.
+# curl is not used by this container and is removed to reduce attack surface.
+RUN apk upgrade --no-cache && apk del --no-cache curl

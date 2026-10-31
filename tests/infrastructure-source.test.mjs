@@ -146,6 +146,7 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
   const releaseEnv = await source("infra/scripts/release-env.sh");
   const apiDockerfile = await source("backend/Dockerfile");
   const webDockerfile = await source("Dockerfile.web");
+  const caddyDockerfile = await source("Dockerfile.caddy");
 
   assert.match(compose, /API_IMAGE:\?Set API_IMAGE to an immutable ECR digest/);
   assert.match(compose, /WEB_IMAGE:\?Set WEB_IMAGE to an immutable ECR digest/);
@@ -159,6 +160,7 @@ test("production releases use ARM64 ECR digests with health-checked rollback", a
     3,
   );
   assert.equal(webDockerfile.match(/RUN apk upgrade --no-cache/g)?.length, 3);
+  assert.match(caddyDockerfile, /RUN apk upgrade --no-cache && apk del --no-cache curl/);
   assert.match(apiDockerfile, /addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app/);
   assert.doesNotMatch(apiDockerfile, /python:3\.12-slim|addgroup --system|adduser --system/);
   assert.match(build, /API_RUNTIME_UID=\$\(docker run --rm --platform linux\/arm64/);

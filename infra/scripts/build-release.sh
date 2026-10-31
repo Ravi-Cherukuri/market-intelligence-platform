@@ -74,9 +74,10 @@ WEB_DIGEST=$(aws ecr describe-images --region "$REGION" --repository-name "$REPO
 docker pull --platform linux/arm64 postgres:16-alpine
 docker tag postgres:16-alpine "$REPOSITORY_URI:postgres-$RELEASE_ID"
 docker push "$REPOSITORY_URI:postgres-$RELEASE_ID"
-docker pull --platform linux/arm64 caddy:2-alpine
-docker tag caddy:2-alpine "$REPOSITORY_URI:caddy-$RELEASE_ID"
-docker push "$REPOSITORY_URI:caddy-$RELEASE_ID"
+docker buildx build --platform linux/arm64 \
+  --file Dockerfile.caddy \
+  --tag "$REPOSITORY_URI:caddy-$RELEASE_ID" \
+  --push .
 POSTGRES_DIGEST=$(aws ecr describe-images --region "$REGION" --repository-name "$REPOSITORY_NAME" \
   --image-ids "imageTag=postgres-$RELEASE_ID" --query 'imageDetails[0].imageDigest' --output text)
 CADDY_DIGEST=$(aws ecr describe-images --region "$REGION" --repository-name "$REPOSITORY_NAME" \
