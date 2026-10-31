@@ -28,7 +28,8 @@ test("dashboard represents the agreed pilot workflows", async () => {
   assert.match(page, /weekly-intelligence/);
   assert.match(page, /week_ending/);
   assert.match(page, /business_scope/);
-  assert.match(page, /Country/);
+  assert.match(page, /All India/);
+  assert.match(page, /Tamilnadu/);
   assert.match(page, /State/);
   assert.match(page, /employee_code/);
   assert.match(uploads, /Upload employee master/i);
@@ -60,7 +61,9 @@ test("employee master upload is wired to preview and commit APIs", async () => {
   assert.match(template, /employee_code,employment_type/);
   assert.match(template, /whatsapp_number/);
   assert.match(proxy, /httpOnly: true/);
-  assert.match(proxy, /pilot_admin_session/);
+  assert.match(proxy, /fieldintel_session/);
+  assert.match(proxy, /REPORT_PASSWORD_HASH/);
+  assert.match(proxy, /scryptSync/);
   assert.match(component, /previewControllerRef\.current\?\.abort/);
   assert.match(component, /previewedFile === file/);
 });

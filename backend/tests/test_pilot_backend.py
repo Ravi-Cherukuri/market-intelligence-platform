@@ -122,6 +122,24 @@ def meta_payload(phone_number_id: str, message: dict[str, Any]) -> dict[str, Any
     }
 
 
+def test_report_login_is_read_only_while_admin_keeps_full_access(client: TestClient) -> None:
+    report_session = client.get("/api/v1/reports/session", auth=("Reports", "report-test-password"))
+    assert report_session.status_code == 200
+    assert report_session.json() == {"role": "reports", "can_admin": False, "default_state": "Tamilnadu"}
+
+    denied_admin = client.get("/api/v1/admin/setup", auth=("Reports", "report-test-password"))
+    assert denied_admin.status_code == 401
+
+    admin_session = client.get("/api/v1/reports/session", auth=("Admin", "Password"))
+    assert admin_session.status_code == 200
+    assert admin_session.json()["can_admin"] is True
+
+
+def test_report_login_rejects_wrong_password(client: TestClient) -> None:
+    response = client.get("/api/v1/reports/session", auth=("Reports", "wrong-password"))
+    assert response.status_code == 401
+
+
 def signed_json(payload: dict[str, Any], secret: str = "test-app-secret") -> tuple[bytes, dict[str, str]]:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()

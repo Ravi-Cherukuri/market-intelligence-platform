@@ -12,6 +12,7 @@ from app.api.dependencies import get_settings as dependency_settings
 from app.config import Settings
 from app.database import Base, get_db
 from app.main import create_app
+from app.security import hash_password
 
 
 @pytest.fixture
@@ -22,6 +23,8 @@ def settings() -> Settings:
         whatsapp_app_secret="test-app-secret",
         whatsapp_verify_token="test-verify-token",
         conversation_timeout_minutes=30,
+        report_username="Reports",
+        report_password_hash=hash_password("report-test-password", salt=b"0123456789abcdef"),
     )
 
 
@@ -74,4 +77,3 @@ def client(
         yield TestClient(app)
     finally:
         app.dependency_overrides.clear()
-

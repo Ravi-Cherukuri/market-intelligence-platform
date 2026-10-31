@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { MasterUploads } from "./components/master-uploads";
 
 type Scope = "all" | "own_business" | "competitor";
-type Geography = "country" | "state";
 type Insight = { title: string; detail: string; business_scope: "own_business" | "competitor"; signal_ids: string[] };
 type CloudTerm = { term: string; weight: number };
 type EvidenceItem = {
@@ -20,6 +19,13 @@ type WeeklyBrief = {
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "/api/v1";
+const INDIAN_STATES_AND_UNION_TERRITORIES = [
+  "Andaman and Nicobar Islands", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chandigarh",
+  "Chhattisgarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Goa", "Gujarat", "Haryana",
+  "Himachal Pradesh", "Jammu and Kashmir", "Jharkhand", "Karnataka", "Kerala", "Ladakh", "Lakshadweep",
+  "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Puducherry",
+  "Punjab", "Rajasthan", "Sikkim", "Tamilnadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
+] as const;
 
 function todayInIndia(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
@@ -39,42 +45,46 @@ function EmptyItems({ kind }: { kind: string }) {
 
 export default function Home() {
   const [view, setView] = useState<"intelligence" | "admin">("intelligence");
+  const [canAdmin, setCanAdmin] = useState(false);
   const [scope, setScope] = useState<Scope>("all");
-  const [geography, setGeography] = useState<Geography>("country");
-  const [state, setState] = useState("");
+  const [state, setState] = useState("Tamilnadu");
   const [weekEnding, setWeekEnding] = useState(todayInIndia);
   const [brief, setBrief] = useState<WeeklyBrief | null>(null);
-  const [availableStates, setAvailableStates] = useState<string[]>([]);
   const [selectedInsight, setSelectedInsight] = useState<Insight | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
 
   const loadBrief = useCallback(async (signal: AbortSignal) => {
-    if (geography === "state" && !state) {
-      setBrief(null);
-      setLoading(false);
-      setError("");
-      return;
-    }
     setLoading(true);
     setError("");
     const params = new URLSearchParams({ week_ending: weekEnding, business_scope: scope });
-    if (geography === "state" && state) params.set("state", state);
+    if (state) params.set("state", state);
     try {
-      const response = await fetch(`${apiBase}/admin/weekly-intelligence?${params}`, { credentials: "same-origin", signal });
+      const response = await fetch(`${apiBase}/reports/weekly-intelligence?${params}`, { credentials: "same-origin", signal });
       const body = await response.json().catch(() => null) as WeeklyBrief | { detail?: string } | null;
       if (!response.ok) throw new Error(body && "detail" in body ? body.detail : "Weekly intelligence is unavailable.");
       const nextBrief = body as WeeklyBrief;
       setBrief(nextBrief);
-      setAvailableStates(nextBrief.available_states);
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
       setError(requestError instanceof Error ? requestError.message : "Weekly intelligence is unavailable.");
     } finally {
       if (!signal.aborted) setLoading(false);
     }
-  }, [geography, scope, state, weekEnding]);
+  }, [scope, state, weekEnding]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch(`${apiBase}/reports/session`, { credentials: "same-origin", signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("Session unavailable")))
+      .then((session: { can_admin: boolean }) => {
+        setCanAdmin(session.can_admin);
+        if (!session.can_admin) setView("intelligence");
+      })
+      .catch((sessionError) => { if (sessionError?.name !== "AbortError") setCanAdmin(false); });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -113,10 +123,10 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">FI</span><div><strong>Field Intelligence</strong><small>Agricultural inputs</small></div></div>
         <nav aria-label="Primary navigation">
           <button className={view === "intelligence" ? "nav-item active" : "nav-item"} onClick={() => setView("intelligence")} type="button"><span className="nav-dot" />Weekly intelligence</button>
-          <button className={view === "admin" ? "nav-item active" : "nav-item"} onClick={() => setView("admin")} type="button"><span className="nav-dot" />Admin setup</button>
+          {canAdmin && <button className={view === "admin" ? "nav-item active" : "nav-item"} onClick={() => setView("admin")} type="button"><span className="nav-dot" />Admin setup</button>}
         </nav>
         <div className="channel-health live"><span className="status-dot" /><div><strong>WhatsApp channel</strong><small>Live · accepting field reports</small></div></div>
-        <div className="profile-row"><span className="avatar">A</span><div><strong>Admin</strong><small>Company Admin</small></div></div>
+        <div className="profile-row"><span className="avatar">{canAdmin ? "A" : "R"}</span><div><strong>{canAdmin ? "Admin" : "Reports"}</strong><small>{canAdmin ? "Company Admin" : "Report viewer"}</small></div></div>
       </aside>
 
       <section className="workspace">
@@ -128,13 +138,10 @@ export default function Home() {
         <div className="content weekly-content">
           {view === "admin" ? <MasterUploads /> : <>
             <section className="intelligence-controls" aria-label="Intelligence filters">
-              <div className="control-group"><span>Market level</span><div className="choice-row">{(["country", "state"] as Geography[]).map((option) => <button className={geography === option ? "choice active" : "choice"} key={option} onClick={() => { setGeography(option); setSelectedInsight(null); if (option === "state") setBrief(null); }} type="button">{option === "country" ? "Country" : "State"}</button>)}</div></div>
-              {geography === "state" && <label className="select-control"><span>State</span><select onChange={(event) => { setState(event.target.value); setSelectedInsight(null); }} value={state}><option value="">Select state</option>{availableStates.map((item) => <option key={item}>{item}</option>)}</select></label>}
+              <label className="select-control"><span>State</span><select onChange={(event) => { setState(event.target.value); setSelectedInsight(null); }} value={state}><option value="">All India</option>{INDIAN_STATES_AND_UNION_TERRITORIES.map((item) => <option key={item}>{item}</option>)}</select></label>
               <label className="select-control"><span>Week ending</span><input max={todayInIndia()} onChange={(event) => { setWeekEnding(event.target.value); setSelectedInsight(null); }} type="date" value={weekEnding} /></label>
               <div className="control-group scope-control"><span>Scope</span><div className="choice-row">{(["all", "own_business", "competitor"] as Scope[]).map((option) => <button className={scope === option ? "choice active" : "choice"} key={option} onClick={() => { setScope(option); setSelectedInsight(null); }} type="button">{scopeLabel(option)}</button>)}</div></div>
             </section>
-
-            {geography === "state" && !state && <section className="dashboard-error"><strong>Select a state</strong><p>Choose a state from the employee master to prepare its seven-day brief.</p></section>}
 
             {error && <section className="dashboard-error" role="alert"><strong>Could not prepare the weekly brief</strong><p>{error}</p><button className="quiet-button" onClick={() => setRefreshKey((value) => value + 1)} type="button">Try again</button></section>}
             {loading && <section className="brief-loading"><span className="spinner" /><div><strong>Synthesising field intelligence</strong><small>Reading evidence-backed signals for the selected week…</small></div></section>}

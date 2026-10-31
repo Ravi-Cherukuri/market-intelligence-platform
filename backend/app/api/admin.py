@@ -1,16 +1,14 @@
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import require_admin
-from app.ai.openai_client import OpenAIIntelligenceClient
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.models import Company, Employee, FieldConversation, FieldMessage, Signal, WhatsAppChannel
-from app.services.weekly_intelligence import get_weekly_intelligence
+from app.api.reports import generate_weekly_intelligence
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -53,37 +51,4 @@ def weekly_intelligence(
     session: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
-    company = session.scalar(select(Company).where(Company.active.is_(True)).order_by(Company.created_at))
-    if not company:
-        raise HTTPException(status_code=503, detail="Pilot company has not been initialized")
-    if not settings.openai_api_key:
-        raise HTTPException(status_code=503, detail="Weekly intelligence synthesis is not configured")
-    selected_date = week_ending or datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    if selected_date > datetime.now(ZoneInfo("Asia/Kolkata")).date():
-        raise HTTPException(status_code=422, detail="Week-ending date cannot be in the future")
-    if state:
-        known = session.scalar(
-            select(Employee.id).where(
-                Employee.company_id == company.id,
-                Employee.active.is_(True),
-                Employee.state == state,
-            )
-        )
-        if not known:
-            raise HTTPException(status_code=422, detail="State is not present in the active employee master")
-    try:
-        result = get_weekly_intelligence(
-            session,
-            company,
-            OpenAIIntelligenceClient(settings.openai_api_key),
-            week_ending=selected_date,
-            state=state,
-            business_scope=business_scope,
-        )
-        session.commit()
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        session.rollback()
-        raise HTTPException(status_code=502, detail="Weekly intelligence synthesis could not be generated") from exc
+    return generate_weekly_intelligence(week_ending, state, business_scope, session, settings)

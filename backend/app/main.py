@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import admin, health, masters, retention, webhooks
+from app.api import admin, health, masters, reports, retention, webhooks
 from app.config import get_settings
 from app.database import Base, engine
 
@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(webhooks.router, prefix=settings.api_prefix)
     app.include_router(admin.router, prefix=settings.api_prefix)
+    app.include_router(reports.router, prefix=settings.api_prefix)
     app.include_router(masters.router, prefix=settings.api_prefix)
     app.include_router(retention.router, prefix=settings.api_prefix)
     return app

@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     # it can be replaced by client-selected SSO without touching domain logic.
     admin_username: str = "Admin"
     admin_password: str = "Password"
+    report_username: str = "Reports"
+    report_password_hash: str = ""
 
     whatsapp_api_version: str = ""
     whatsapp_access_token: str = ""
@@ -60,6 +62,8 @@ class Settings(BaseSettings):
             errors.append("DATABASE_URL must point to PostgreSQL")
         if self.admin_password == "Password" or len(self.admin_password) < 12:
             errors.append("ADMIN_PASSWORD must be changed and contain at least 12 characters")
+        if not self.report_password_hash.startswith("scrypt$"):
+            errors.append("REPORT_PASSWORD_HASH must contain a valid scrypt verifier")
         required = {
             "WHATSAPP_API_VERSION": self.whatsapp_api_version,
             "WHATSAPP_APP_SECRET": self.whatsapp_app_secret,

@@ -65,6 +65,8 @@ services:
       API_INTERNAL_URL: http://api:8000
       ADMIN_USERNAME: ${ADMIN_USERNAME:-Admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      REPORT_USERNAME: ${REPORT_USERNAME:-Reports}
+      REPORT_PASSWORD_HASH: ${REPORT_PASSWORD_HASH:?Set REPORT_PASSWORD_HASH in .env}
     depends_on:
       - api
     restart: unless-stopped
